@@ -1,0 +1,390 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"satoshisend/internal/files"
+	"satoshisend/internal/payments"
+	"satoshisend/internal/store"
+)
+
+// Test mocks
+
+type mockStorage struct {
+	files map[string][]byte
+}
+
+func newMockStorage() *mockStorage {
+	return &mockStorage{files: make(map[string][]byte)}
+}
+
+func (m *mockStorage) Save(ctx context.Context, id string, data io.Reader) (int64, error) {
+	return m.SaveWithProgress(ctx, id, data, -1, nil)
+}
+
+func (m *mockStorage) SaveWithProgress(ctx context.Context, id string, data io.Reader, size int64, onProgress files.ProgressFunc) (int64, error) {
+	buf, _ := io.ReadAll(data)
+	m.files[id] = buf
+	if onProgress != nil {
+		onProgress(int64(len(buf)), int64(len(buf)))
+	}
+	return int64(len(buf)), nil
+}
+
+func (m *mockStorage) Load(ctx context.Context, id string) (io.ReadCloser, error) {
+	data, ok := m.files[id]
+	if !ok {
+		return nil, files.ErrNotFound
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+func (m *mockStorage) Delete(ctx context.Context, id string) error {
+	delete(m.files, id)
+	return nil
+}
+
+type mockStore struct {
+	files map[string]*store.FileMeta
+}
+
+func newMockStore() *mockStore {
+	return &mockStore{files: make(map[string]*store.FileMeta)}
+}
+
+func (m *mockStore) SaveFileMetadata(ctx context.Context, meta *store.FileMeta) error {
+	m.files[meta.ID] = meta
+	return nil
+}
+
+func (m *mockStore) GetFileMetadata(ctx context.Context, id string) (*store.FileMeta, error) {
+	meta, ok := m.files[id]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	return meta, nil
+}
+
+func (m *mockStore) UpdatePaymentStatus(ctx context.Context, fileID string, paid bool) error {
+	if meta, ok := m.files[fileID]; ok {
+		meta.Paid = paid
+	}
+	return nil
+}
+
+func (m *mockStore) DeleteFileMetadata(ctx context.Context, id string) error {
+	delete(m.files, id)
+	return nil
+}
+
+func (m *mockStore) ListExpiredFiles(ctx context.Context) ([]*store.FileMeta, error) {
+	return nil, nil
+}
+
+func (m *mockStore) GetStats(ctx context.Context) (*store.Stats, error) {
+	return &store.Stats{}, nil
+}
+
+func (m *mockStore) Close() error {
+	return nil
+}
+
+func setupTestHandler() (*Handler, *mockStore) {
+	storage := newMockStorage()
+	st := newMockStore()
+	lnd := payments.NewMockLNDClient()
+
+	filesSvc := files.NewService(storage, st)
+	paymentsSvc := payments.NewService(lnd, st)
+
+	handler := NewHandler(filesSvc, paymentsSvc)
+	return handler, st
+}
+
+func TestHandler_Upload(t *testing.T) {
+	handler, _ := setupTestHandler()
+
+	// Create multipart form
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, _ := writer.CreateFormFile("file", "test.txt")
+	part.Write([]byte("encrypted content here"))
+	writer.Close()
+
+	req := httptest.NewRequest("POST", "/api/upload", &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Parse the upload start response
+	var startResp UploadStartResponse
+	if err := json.NewDecoder(rec.Body).Decode(&startResp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if startResp.UploadID == "" {
+		t.Error("expected upload ID in response")
+	}
+	if startResp.Size == 0 {
+		t.Error("expected size in response")
+	}
+
+	// Poll for progress until complete (with timeout)
+	var progressResp UploadProgressResponse
+	for i := 0; i < 50; i++ { // Max 5 seconds
+		req := httptest.NewRequest("GET", "/api/upload/"+startResp.UploadID+"/progress", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d", rec.Code)
+			break
+		}
+
+		if err := json.NewDecoder(rec.Body).Decode(&progressResp); err != nil {
+			t.Fatalf("failed to decode progress: %v", err)
+		}
+
+		if progressResp.Status == "complete" {
+			break
+		}
+		if progressResp.Status == "error" {
+			t.Fatalf("upload failed: %s", progressResp.Error)
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if progressResp.Status != "complete" {
+		t.Fatalf("upload did not complete, status: %s", progressResp.Status)
+	}
+	if progressResp.Result == nil {
+		t.Fatal("expected result in completed response")
+	}
+	if progressResp.Result.FileID == "" {
+		t.Error("expected file ID in result")
+	}
+	if progressResp.Result.PaymentRequest == "" {
+		t.Error("expected payment request in result")
+	}
+}
+
+func TestHandler_Download_NotPaid(t *testing.T) {
+	handler, st := setupTestHandler()
+
+	// Create a file that's not paid
+	st.SaveFileMetadata(context.Background(), &store.FileMeta{
+		ID:        "abc123def456789",
+		Size:      100,
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+		Paid:      false,
+		CreatedAt: time.Now(),
+	})
+
+	req := httptest.NewRequest("GET", "/api/file/abc123def456789", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusPaymentRequired {
+		t.Errorf("expected 402, got %d", rec.Code)
+	}
+}
+
+func TestHandler_Status(t *testing.T) {
+	handler, st := setupTestHandler()
+
+	st.SaveFileMetadata(context.Background(), &store.FileMeta{
+		ID:        "statustest123456",
+		Size:      2048,
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+		Paid:      true,
+		CreatedAt: time.Now(),
+	})
+
+	req := httptest.NewRequest("GET", "/api/file/statustest123456/status", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", rec.Code)
+	}
+
+	var resp StatusResponse
+	json.NewDecoder(rec.Body).Decode(&resp)
+
+	if !resp.Paid {
+		t.Error("expected paid to be true")
+	}
+	if resp.Size != 2048 {
+		t.Errorf("expected size 2048, got %d", resp.Size)
+	}
+}
+
+func TestHandler_InvalidFileID(t *testing.T) {
+	handler, _ := setupTestHandler()
+
+	tests := []struct {
+		name     string
+		fileID   string
+		expected int
+	}{
+		{"special chars", "file<script>", http.StatusBadRequest},
+		{"dots in name", "file..test", http.StatusBadRequest},
+		{"slashes encoded", "file%2Ftest", http.StatusBadRequest},
+		{"too long", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", http.StatusBadRequest},
+		{"dashes", "file-test", http.StatusBadRequest},
+		{"underscores", "file_test", http.StatusBadRequest},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/api/file/"+tc.fileID+"/status", nil)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != tc.expected {
+				t.Errorf("expected %d for %q, got %d", tc.expected, tc.fileID, rec.Code)
+			}
+		})
+	}
+}
+
+func TestCORS_AllowAll(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	corsHandler := CORS(CORSConfig{})(handler)
+
+	req := httptest.NewRequest("GET", "/api/test", nil)
+	req.Header.Set("Origin", "https://evil.com")
+	rec := httptest.NewRecorder()
+
+	corsHandler.ServeHTTP(rec, req)
+
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("expected *, got %q", got)
+	}
+}
+
+func TestCORS_RestrictedOrigins(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	corsHandler := CORS(CORSConfig{
+		AllowedOrigins: []string{"https://satoshisend.xyz", "https://localhost:3000"},
+	})(handler)
+
+	t.Run("allowed origin", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/test", nil)
+		req.Header.Set("Origin", "https://satoshisend.xyz")
+		rec := httptest.NewRecorder()
+
+		corsHandler.ServeHTTP(rec, req)
+
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://satoshisend.xyz" {
+			t.Errorf("expected https://satoshisend.xyz, got %q", got)
+		}
+	})
+
+	t.Run("disallowed origin", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/test", nil)
+		req.Header.Set("Origin", "https://evil.com")
+		rec := httptest.NewRecorder()
+
+		corsHandler.ServeHTTP(rec, req)
+
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+			t.Errorf("expected empty, got %q", got)
+		}
+	})
+
+	t.Run("preflight request", func(t *testing.T) {
+		req := httptest.NewRequest("OPTIONS", "/api/test", nil)
+		req.Header.Set("Origin", "https://satoshisend.xyz")
+		rec := httptest.NewRecorder()
+
+		corsHandler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected 200 for preflight, got %d", rec.Code)
+		}
+	})
+}
+
+func TestRateLimit(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// Very restrictive config for testing
+	cfg := RateLimitConfig{
+		RequestsPerSecond:       1,
+		BurstSize:               2,
+		UploadRequestsPerMinute: 1,
+		UploadBurstSize:         1,
+	}
+
+	rateLimitedHandler := RateLimit(cfg)(handler)
+
+	t.Run("allows requests within limit", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/test", nil)
+		req.RemoteAddr = "192.168.1.1:12345"
+		rec := httptest.NewRecorder()
+
+		rateLimitedHandler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d", rec.Code)
+		}
+	})
+
+	t.Run("blocks requests exceeding limit", func(t *testing.T) {
+		// Use a different IP to get a fresh limiter
+		for i := 0; i < 5; i++ {
+			req := httptest.NewRequest("GET", "/api/test", nil)
+			req.RemoteAddr = "10.0.0.1:12345"
+			rec := httptest.NewRecorder()
+
+			rateLimitedHandler.ServeHTTP(rec, req)
+
+			// First 2 should pass (burst), rest should be rate limited
+			if i < 2 && rec.Code != http.StatusOK {
+				t.Errorf("request %d: expected 200, got %d", i, rec.Code)
+			}
+			if i >= 2 && rec.Code != http.StatusTooManyRequests {
+				t.Errorf("request %d: expected 429, got %d", i, rec.Code)
+			}
+		}
+	})
+
+	t.Run("uses X-Forwarded-For header", func(t *testing.T) {
+		// This IP gets a fresh limiter
+		req := httptest.NewRequest("GET", "/api/test", nil)
+		req.RemoteAddr = "127.0.0.1:12345"
+		req.Header.Set("X-Forwarded-For", "203.0.113.50, 70.41.3.18")
+		rec := httptest.NewRecorder()
+
+		rateLimitedHandler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d", rec.Code)
+		}
+	})
+}

@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>SatoshiSend - Encrypted File Sharing</title>
+
+        <!-- SEO Meta Tags -->
+        <meta name="description" content="Share files securely with end-to-end encryption and Bitcoin Lightning payments. Files are encrypted in your browser before upload - the server never sees your data." />
+        <meta name="keywords" content="file sharing, encrypted, end-to-end encryption, Bitcoin, Lightning Network, privacy, secure file transfer" />
+        <meta name="author" content="SatoshiSend" />
+        <meta name="robots" content="index, follow" />
+        <link rel="canonical" href="https://satoshisend.xyz" />
+
+        <!-- Open Graph / Social -->
+        <meta property="og:type" content="website" />
+        <meta property="og:url" content="https://satoshisend.xyz" />
+        <meta property="og:title" content="SatoshiSend - Encrypted File Sharing" />
+        <meta property="og:description" content="Share files securely with end-to-end encryption and Bitcoin Lightning payments." />
+        <meta property="og:site_name" content="SatoshiSend" />
+
+        <!-- Twitter Card -->
+        <meta name="twitter:card" content="summary" />
+        <meta name="twitter:title" content="SatoshiSend - Encrypted File Sharing" />
+        <meta name="twitter:description" content="Share files securely with end-to-end encryption and Bitcoin Lightning payments." />
+
+        <!-- JSON-LD Structured Data -->
+        <script type="application/ld+json">
+        {
+            "@context": "https://schema.org",
+            "@type": "WebApplication",
+            "name": "SatoshiSend",
+            "url": "https://satoshisend.xyz",
+            "description": "Encrypted file sharing with Bitcoin Lightning payments. Files are encrypted client-side before upload, ensuring the server never has access to unencrypted content.",
+            "applicationCategory": "FileSharing",
+            "operatingSystem": "Any",
+            "offers": {
+                "@type": "Offer",
+                "price": "0.00000100",
+                "priceCurrency": "BTC",
+                "description": "1 sat per MB, minimum 100 sats for 7 days hosting"
+            },
+            "featureList": [
+                "End-to-end encryption",
+                "Client-side encryption using AES-GCM",
+                "Bitcoin Lightning Network payments",
+                "Zero-knowledge file storage",
+                "No account required"
+            ],
+            "potentialAction": {
+                "@type": "ShareAction",
+                "target": "Upload and share encrypted files"
+            }
+        }
+        </script>
+
+        <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+        <link rel="stylesheet" href="/css/style.css" />
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode/1.4.4/qrcode.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/streamsaver@2.0.6/StreamSaver.min.js"></script>
+    </head>
+    <body>
+        <div class="container">
+            <header>
+                <a href="/" class="logo-container">
+                    <div class="logo-icon">
+                        <svg
+                            viewBox="0 0 80 80"
+                            fill="none"
+                            xmlns="http://www.w3.org/2000/svg"
+                        >
+                            <!-- Outer glow circle -->
+                            <circle
+                                cx="40"
+                                cy="40"
+                                r="38"
+                                fill="url(#logoGradient)"
+                                opacity="0.15"
+                            />
+                            <!-- Main Bitcoin circle -->
+                            <circle
+                                cx="40"
+                                cy="40"
+                                r="32"
+                                fill="url(#logoGradient)"
+                            />
+                            <!-- Bitcoin B symbol -->
+                            <path
+                                d="M52.5 34.2c.6-4-2.4-6.2-6.6-7.6l1.4-5.5-3.3-.8-1.3 5.3c-.9-.2-1.8-.4-2.7-.7l1.3-5.3-3.3-.8-1.4 5.5c-.7-.2-1.4-.3-2.1-.5l-4.5-1.1-.9 3.5s2.4.6 2.4.6c1.3.3 1.6 1.2 1.5 1.9l-1.5 6.2c.1 0 .2.1.3.1l-.3-.1-2.2 8.7c-.2.4-.6 1.1-1.6.8 0 0-2.4-.6-2.4-.6l-1.6 3.8 4.3 1.1c.8.2 1.6.4 2.3.6l-1.4 5.6 3.3.8 1.4-5.5c.9.2 1.8.5 2.7.7l-1.4 5.5 3.3.8 1.4-5.6c5.8 1.1 10.1.7 12-4.6 1.5-4.2-.1-6.7-3.1-8.3 2.2-.5 3.9-2 4.3-5zm-7.7 10.8c-1.1 4.2-8.3 1.9-10.6 1.4l1.9-7.5c2.4.6 9.9 1.7 8.7 6.1zm1.1-10.9c-1 3.9-7 1.9-8.9 1.4l1.7-6.8c2 .5 8.3 1.4 7.2 5.4z"
+                                fill="#fff"
+                            />
+                            <defs>
+                                <linearGradient
+                                    id="logoGradient"
+                                    x1="0%"
+                                    y1="0%"
+                                    x2="100%"
+                                    y2="100%"
+                                >
+                                    <stop offset="0%" stop-color="#f7931a" />
+                                    <stop offset="100%" stop-color="#e8750a" />
+                                </linearGradient>
+                            </defs>
+                        </svg>
+                    </div>
+                    <div class="logo-text">
+                        <h1>Satoshi<span>Send</span></h1>
+                        <p class="tagline">
+                            Private file sharing. Pay in sats.
+                        </p>
+                    </div>
+                </a>
+                <div class="features">
+                    <div class="feature">
+                        <svg
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2"
+                        >
+                            <rect
+                                x="3"
+                                y="11"
+                                width="18"
+                                height="11"
+                                rx="2"
+                                ry="2"
+                            />
+                            <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                        </svg>
+                        <span>AES-256 encrypted</span>
+                    </div>
+                    <div class="feature">
+                        <svg
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2"
+                        >
+                            <polygon
+                                points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"
+                            />
+                        </svg>
+                        <span>Bitcoin Lightning payments</span>
+                    </div>
+                </div>
+            </header>
+
+            <div id="upload-section" class="section">
+                <h2>Upload a File</h2>
+                <div class="file-drop-zone" id="drop-zone">
+                    <input type="file" id="file-input" />
+                    <svg
+                        class="file-drop-icon"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.5"
+                    >
+                        <path
+                            d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"
+                        />
+                    </svg>
+                    <p class="file-drop-text">
+                        <strong>Click to upload</strong> or drag and drop
+                    </p>
+                    <p class="file-drop-limit">Max file size: 5 GB</p>
+                    <p class="file-name hidden" id="selected-file-name"></p>
+                </div>
+                <button id="upload-btn" disabled>Encrypt & Upload</button>
+                <div class="pricing-info">
+                    <div class="pricing-header">Pricing</div>
+                    <div class="pricing-details">
+                        <span class="pricing-rate">1 sat/MB</span>
+                        <span class="pricing-separator">·</span>
+                        <span class="pricing-minimum">100 sat minimum</span>
+                        <span class="pricing-separator">·</span>
+                        <span class="pricing-duration">7 days hosting</span>
+                    </div>
+                </div>
+                <div id="upload-progress" class="phase-progress hidden">
+                    <div class="phase" data-phase="0">
+                        <div class="phase-label">
+                            <span class="phase-icon">1</span>
+                            <span class="phase-name">Encrypt</span>
+                        </div>
+                        <div class="phase-bar"><div class="phase-fill"></div></div>
+                    </div>
+                    <div class="phase" data-phase="1">
+                        <div class="phase-label">
+                            <span class="phase-icon">2</span>
+                            <span class="phase-name">Upload</span>
+                        </div>
+                        <div class="phase-bar"><div class="phase-fill"></div></div>
+                    </div>
+                    <div class="phase" data-phase="2">
+                        <div class="phase-label">
+                            <span class="phase-icon">3</span>
+                            <span class="phase-name">Secure</span>
+                        </div>
+                        <div class="phase-bar"><div class="phase-fill"></div></div>
+                    </div>
+                    <p class="phase-status" id="upload-status"></p>
+                </div>
+            </div>
+
+            <div id="payment-section" class="section hidden">
+                <h2>Pay to Host</h2>
+                <div class="invoice-container">
+                    <div class="qr-container" id="qr-container"></div>
+                    <div class="invoice-code-wrapper">
+                        <code id="invoice-code"></code>
+                        <button id="copy-invoice" class="secondary">
+                            Copy
+                        </button>
+                    </div>
+                </div>
+                <div class="amount-display">
+                    <span class="sats" id="amount-sats"></span>
+                    <span class="label">sats</span>
+                </div>
+                <div class="payment-status" id="payment-status">
+                    <div class="spinner"></div>
+                    <span>Waiting for payment...</span>
+                </div>
+            </div>
+
+            <div id="share-section" class="section hidden">
+                <h2>Share Your File</h2>
+                <p>Payment received! Share this link:</p>
+                <div class="share-link">
+                    <input type="text" id="share-url" readonly />
+                    <button id="copy-link" class="secondary">Copy</button>
+                </div>
+                <p class="note">
+                    The decryption key is in the URL fragment - only people with
+                    this exact link can decrypt the file.
+                </p>
+            </div>
+
+            <div id="download-section" class="section hidden">
+                <h2>Download File</h2>
+                <p id="download-intro">Click below to download and decrypt this file.</p>
+                <button id="start-download-btn">Download & Decrypt</button>
+                <div id="download-progress" class="phase-progress hidden">
+                    <div class="phase" data-phase="0" id="dl-phase-fetch">
+                        <div class="phase-label">
+                            <span class="phase-icon">1</span>
+                            <span class="phase-name">Fetch</span>
+                        </div>
+                        <div class="phase-bar"><div class="phase-fill"></div></div>
+                    </div>
+                    <div class="phase" data-phase="1" id="dl-phase-decrypt">
+                        <div class="phase-label">
+                            <span class="phase-icon">2</span>
+                            <span class="phase-name">Decrypt</span>
+                        </div>
+                        <div class="phase-bar"><div class="phase-fill"></div></div>
+                    </div>
+                    <p class="phase-status" id="download-status"></p>
+                </div>
+                <button id="save-file-btn" class="hidden">Save File</button>
+            </div>
+
+            <div class="why-section">
+                <h2>Why SatoshiSend?</h2>
+                <div class="why-grid">
+                    <div class="why-item">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                            <circle cx="12" cy="12" r="3"/>
+                            <line x1="1" y1="1" x2="23" y2="23"/>
+                        </svg>
+                        <h3>We can't see your files</h3>
+                        <p>Encrypted in your browser. The key lives only in your link - never on our servers.</p>
+                    </div>
+                    <div class="why-item">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+                            <circle cx="12" cy="7" r="4"/>
+                            <line x1="2" y1="2" x2="22" y2="22"/>
+                        </svg>
+                        <h3>We don't know who you are</h3>
+                        <p>No account. No email. Pay with Bitcoin and share.</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="how-it-works">
+                <h2>How It Works</h2>
+                <div class="steps">
+                    <div class="step">
+                        <div class="step-number">1</div>
+                        <div class="step-content">
+                            <h3>Client-Side Encryption</h3>
+                            <p>
+                                Your file is encrypted in your browser using
+                                <strong>AES-256-GCM</strong> before it ever
+                                leaves your device. The encryption key is
+                                generated locally and never sent to our servers.
+                                Powered by the Web Crypto API built into your browser.
+                            </p>
+                        </div>
+                    </div>
+                    <div class="step">
+                        <div class="step-number">2</div>
+                        <div class="step-content">
+                            <h3>Pay with Lightning</h3>
+                            <p>
+                                Pay a small fee (1 sat/MB, minimum 100 sats) via
+                                the Lightning Network to host your encrypted
+                                file for 7 days.
+                            </p>
+                        </div>
+                    </div>
+                    <div class="step">
+                        <div class="step-number">3</div>
+                        <div class="step-content">
+                            <h3>Share Securely</h3>
+                            <p>
+                                The decryption key is stored in the URL fragment
+                                (after the #), which is
+                                <strong>never sent to the server</strong>. Only
+                                people with your exact link can decrypt the
+                                file.
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <footer>
+            <a href="https://github.com/alecsmrekar/satoshisend" target="_blank" rel="noopener">GitHub</a>
+            <span>·</span>
+            <a href="https://tally.so/r/RGdyO9" target="_blank" rel="noopener">Feedback</a>
+        </footer>
+
+        <script type="module" src="/js/upload.js"></script>
+        <script type="module" src="/js/download.js"></script>
+        <script type="module" src="/js/app.js"></script>
+    </body>
+</html>
