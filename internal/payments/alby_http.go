@@ -265,8 +265,13 @@ func (c *AlbyHTTPClient) HandleWebhook(body []byte, headers http.Header) error {
 			PaymentHash: payload.PaymentHash,
 			Settled:     true,
 		}:
+			logging.Alby.Printf("webhook: queued payment %s (buffer: %d/%d)", payload.PaymentHash[:16], len(c.updates), cap(c.updates))
 		default:
-			logging.Alby.Printf("webhook: warning - update channel full, payment %s may be delayed", payload.PaymentHash[:16])
+			// CRITICAL: Payment notification is DROPPED, not delayed!
+			// The user has paid but their file will not be activated.
+			// TODO: Implement proper persistence/retry mechanism if this ever occurs.
+			logging.Alby.Printf("webhook: CRITICAL - update channel full (%d/%d), payment %s LOST! User paid but file will not activate. Payment hash: %s",
+				len(c.updates), cap(c.updates), payload.PaymentHash[:16], payload.PaymentHash)
 		}
 	}
 
