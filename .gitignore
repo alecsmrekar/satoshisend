@@ -3,3 +3,4 @@ satoshisend.db
 btcsend.db
 satoshisend
 run-local.sh
+.DS_Store

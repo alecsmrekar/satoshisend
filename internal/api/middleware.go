@@ -98,56 +98,143 @@ func DefaultRateLimitConfig() RateLimitConfig {
 	}
 }
 
-// ipRateLimiter manages per-IP rate limiters.
+// trackedLimiter wraps a rate.Limiter with last-access tracking.
+type trackedLimiter struct {
+	limiter  *rate.Limiter
+	lastSeen int64 // Unix timestamp, updated atomically
+}
+
+// ipRateLimiter manages per-IP rate limiters with automatic cleanup.
 type ipRateLimiter struct {
-	limiters sync.Map // map[string]*rate.Limiter
+	limiters sync.Map // map[string]*trackedLimiter
 	rate     rate.Limit
 	burst    int
+	ttl      time.Duration // How long to keep idle limiters
+	stopCh   chan struct{}
+	stopped  bool
+	mu       sync.Mutex
 }
 
 func newIPRateLimiter(r float64, burst int) *ipRateLimiter {
-	return &ipRateLimiter{
-		rate:  rate.Limit(r),
-		burst: burst,
+	return newIPRateLimiterWithTTL(r, burst, 10*time.Minute)
+}
+
+func newIPRateLimiterWithTTL(r float64, burst int, ttl time.Duration) *ipRateLimiter {
+	rl := &ipRateLimiter{
+		rate:   rate.Limit(r),
+		burst:  burst,
+		ttl:    ttl,
+		stopCh: make(chan struct{}),
 	}
+	go rl.cleanupLoop()
+	return rl
 }
 
 func (rl *ipRateLimiter) getLimiter(ip string) *rate.Limiter {
-	if limiter, exists := rl.limiters.Load(ip); exists {
-		return limiter.(*rate.Limiter)
+	now := time.Now().Unix()
+
+	if val, exists := rl.limiters.Load(ip); exists {
+		tracked := val.(*trackedLimiter)
+		// Update last seen time (atomic via sync.Map reload pattern is fine here,
+		// slight races are acceptable for TTL tracking)
+		tracked.lastSeen = now
+		return tracked.limiter
 	}
 
-	limiter := rate.NewLimiter(rl.rate, rl.burst)
-	rl.limiters.Store(ip, limiter)
-	return limiter
+	tracked := &trackedLimiter{
+		limiter:  rate.NewLimiter(rl.rate, rl.burst),
+		lastSeen: now,
+	}
+	// Use LoadOrStore to handle race conditions
+	actual, _ := rl.limiters.LoadOrStore(ip, tracked)
+	return actual.(*trackedLimiter).limiter
 }
 
-// RateLimit creates a rate limiting middleware.
-// It applies different limits for upload endpoints vs general API requests.
-func RateLimit(cfg RateLimitConfig) func(http.Handler) http.Handler {
-	generalLimiter := newIPRateLimiter(cfg.RequestsPerSecond, cfg.BurstSize)
-	uploadLimiter := newIPRateLimiter(cfg.UploadRequestsPerMinute/60, cfg.UploadBurstSize)
+// cleanupLoop periodically removes stale rate limiters.
+func (rl *ipRateLimiter) cleanupLoop() {
+	ticker := time.NewTicker(rl.ttl / 2) // Cleanup at half the TTL interval
+	defer ticker.Stop()
 
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ip := extractIP(r)
+	for {
+		select {
+		case <-ticker.C:
+			rl.cleanup()
+		case <-rl.stopCh:
+			return
+		}
+	}
+}
 
-			// Use stricter limits for upload endpoint
-			var limiter *rate.Limiter
-			if r.Method == "POST" && r.URL.Path == "/api/upload" {
-				limiter = uploadLimiter.getLimiter(ip)
-			} else {
-				limiter = generalLimiter.getLimiter(ip)
-			}
+// cleanup removes limiters that haven't been used within the TTL.
+func (rl *ipRateLimiter) cleanup() {
+	cutoff := time.Now().Add(-rl.ttl).Unix()
+	var removed int
 
-			if !limiter.Allow() {
-				logging.HTTP.Printf("rate limit exceeded for %s on %s %s", ip, r.Method, r.URL.Path)
-				http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
-				return
-			}
+	rl.limiters.Range(func(key, value any) bool {
+		tracked := value.(*trackedLimiter)
+		if tracked.lastSeen < cutoff {
+			rl.limiters.Delete(key)
+			removed++
+		}
+		return true
+	})
 
-			next.ServeHTTP(w, r)
-		})
+	if removed > 0 {
+		logging.Internal.Printf("rate limiter cleanup: removed %d stale entries", removed)
+	}
+}
+
+// Stop halts the cleanup goroutine. Call this during graceful shutdown.
+func (rl *ipRateLimiter) Stop() {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	if !rl.stopped {
+		close(rl.stopCh)
+		rl.stopped = true
+	}
+}
+
+// RateLimiterMiddleware wraps rate limiting middleware with cleanup management.
+type RateLimiterMiddleware struct {
+	generalLimiter *ipRateLimiter
+	uploadLimiter  *ipRateLimiter
+}
+
+// Middleware returns the HTTP middleware function.
+func (rlm *RateLimiterMiddleware) Middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := extractIP(r)
+
+		// Use stricter limits for upload endpoint
+		var limiter *rate.Limiter
+		if r.Method == "POST" && r.URL.Path == "/api/upload" {
+			limiter = rlm.uploadLimiter.getLimiter(ip)
+		} else {
+			limiter = rlm.generalLimiter.getLimiter(ip)
+		}
+
+		if !limiter.Allow() {
+			logging.HTTP.Printf("rate limit exceeded for %s on %s %s", ip, r.Method, r.URL.Path)
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// Stop halts all cleanup goroutines. Call this during graceful shutdown.
+func (rlm *RateLimiterMiddleware) Stop() {
+	rlm.generalLimiter.Stop()
+	rlm.uploadLimiter.Stop()
+}
+
+// NewRateLimiter creates a rate limiting middleware with automatic cleanup.
+// Call Stop() on the returned middleware during graceful shutdown.
+func NewRateLimiter(cfg RateLimitConfig) *RateLimiterMiddleware {
+	return &RateLimiterMiddleware{
+		generalLimiter: newIPRateLimiter(cfg.RequestsPerSecond, cfg.BurstSize),
+		uploadLimiter:  newIPRateLimiter(cfg.UploadRequestsPerMinute/60, cfg.UploadBurstSize),
 	}
 }
 

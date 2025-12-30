@@ -151,6 +151,12 @@ func main() {
 	}
 	paymentsSvc := payments.NewService(lndClient, st)
 
+	// Create pending file limiter (max 3 pending files per IP)
+	pendingLimiter := api.NewPendingFileLimiter(3)
+
+	// Set payment callback to clear pending file tracking when payment is received
+	paymentsSvc.SetPaymentCallback(pendingLimiter.OnPaymentReceived)
+
 	// Start payment watcher
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -174,12 +180,18 @@ func main() {
 				} else if count > 0 {
 					logging.Internal.Printf("cleaned up %d expired files", count)
 				}
+
+				// Cleanup expired entries from pending file limiter
+				limiterCount := pendingLimiter.CleanupExpired(files.PendingTimeout)
+				if limiterCount > 0 {
+					logging.Internal.Printf("cleaned up %d expired pending file entries", limiterCount)
+				}
 			}
 		}
 	}()
 
 	// Setup HTTP handler
-	handler := api.NewHandler(filesSvc, paymentsSvc)
+	handler := api.NewHandler(filesSvc, paymentsSvc, pendingLimiter)
 
 	// Wire up Alby webhook handler if configured
 	if albyClient != nil {
@@ -214,8 +226,10 @@ func main() {
 	// Apply middleware (order: Logger -> RateLimit -> CORS -> handler)
 	var finalHandler http.Handler = mux
 	finalHandler = api.CORS(corsConfig)(finalHandler)
+	var rateLimiter *api.RateLimiterMiddleware
 	if !*devMode {
-		finalHandler = api.RateLimit(api.DefaultRateLimitConfig())(finalHandler)
+		rateLimiter = api.NewRateLimiter(api.DefaultRateLimitConfig())
+		finalHandler = rateLimiter.Middleware(finalHandler)
 		logging.Internal.Println("rate limiting enabled")
 	}
 	finalHandler = api.Logger(finalHandler)
@@ -233,6 +247,11 @@ func main() {
 
 		logging.Internal.Println("shutting down...")
 		cancel()
+
+		// Stop rate limiter cleanup goroutines
+		if rateLimiter != nil {
+			rateLimiter.Stop()
+		}
 
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()

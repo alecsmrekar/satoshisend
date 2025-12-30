@@ -13,6 +13,9 @@ var (
 	ErrInvoiceNotFound = errors.New("invoice not found")
 )
 
+// PaymentCallback is called when a payment is received for a file.
+type PaymentCallback func(fileID string)
+
 // PendingInvoice tracks an invoice waiting for payment.
 type PendingInvoice struct {
 	FileID      string
@@ -25,9 +28,10 @@ type Service struct {
 	lnd   LNDClient
 	store store.Store
 
-	mu       sync.RWMutex
-	pending  map[string]*PendingInvoice // keyed by payment hash
-	byFileID map[string]*PendingInvoice // keyed by file ID
+	mu        sync.RWMutex
+	pending   map[string]*PendingInvoice // keyed by payment hash
+	byFileID  map[string]*PendingInvoice // keyed by file ID
+	onPayment PaymentCallback            // optional callback when payment received
 }
 
 // NewService creates a new payment service.
@@ -75,6 +79,15 @@ func (s *Service) GetInvoiceForFile(fileID string) (*PendingInvoice, error) {
 	return pending, nil
 }
 
+// SetPaymentCallback sets a callback function that will be called when a
+// payment is received. This allows external components (like rate limiters)
+// to be notified of payments.
+func (s *Service) SetPaymentCallback(cb PaymentCallback) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onPayment = cb
+}
+
 // StartPaymentWatcher starts watching for invoice payments.
 // It marks files as paid when their invoices are settled.
 func (s *Service) StartPaymentWatcher(ctx context.Context) error {
@@ -105,6 +118,7 @@ func (s *Service) StartPaymentWatcher(ctx context.Context) error {
 func (s *Service) handlePayment(ctx context.Context, paymentHash string) {
 	s.mu.Lock()
 	pending, ok := s.pending[paymentHash]
+	cb := s.onPayment
 	if ok {
 		delete(s.pending, paymentHash)
 		delete(s.byFileID, pending.FileID)
@@ -114,6 +128,18 @@ func (s *Service) handlePayment(ctx context.Context, paymentHash string) {
 	if ok {
 		if err := s.store.UpdatePaymentStatus(ctx, pending.FileID, true); err != nil {
 			logging.Internal.Printf("CRITICAL: failed to mark file %s as paid after receiving payment: %v", pending.FileID, err)
+		}
+
+		// Notify callback (e.g., pending file limiter)
+		if cb != nil {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						logging.Internal.Printf("payment callback panic for file %s: %v", pending.FileID, r)
+					}
+				}()
+				cb(pending.FileID)
+			}()
 		}
 	}
 }

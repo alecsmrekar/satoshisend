@@ -105,7 +105,7 @@ func setupTestHandler() (*Handler, *mockStore) {
 	filesSvc := files.NewService(storage, st)
 	paymentsSvc := payments.NewService(lnd, st)
 
-	handler := NewHandler(filesSvc, paymentsSvc)
+	handler := NewHandler(filesSvc, paymentsSvc, nil)
 	return handler, st
 }
 
@@ -341,7 +341,9 @@ func TestRateLimit(t *testing.T) {
 		UploadBurstSize:         1,
 	}
 
-	rateLimitedHandler := RateLimit(cfg)(handler)
+	rateLimiter := NewRateLimiter(cfg)
+	defer rateLimiter.Stop() // Clean up goroutines
+	rateLimitedHandler := rateLimiter.Middleware(handler)
 
 	t.Run("allows requests within limit", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/api/test", nil)
@@ -387,6 +389,80 @@ func TestRateLimit(t *testing.T) {
 			t.Errorf("expected 200, got %d", rec.Code)
 		}
 	})
+}
+
+func TestRateLimiterCleanup(t *testing.T) {
+	// Use a short TTL for testing (must be >= 1 second since lastSeen uses Unix seconds)
+	rl := newIPRateLimiterWithTTL(10, 5, 1*time.Second)
+	defer rl.Stop()
+
+	// Access some IPs to create limiter entries
+	rl.getLimiter("192.168.1.1")
+	rl.getLimiter("192.168.1.2")
+	rl.getLimiter("192.168.1.3")
+
+	// Verify entries exist
+	count := 0
+	rl.limiters.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	if count != 3 {
+		t.Errorf("expected 3 entries, got %d", count)
+	}
+
+	// Wait for TTL to expire (need > 1 second since lastSeen uses Unix seconds)
+	// Use 2 seconds to account for timing precision on busy systems
+	time.Sleep(2 * time.Second)
+
+	// Manually trigger cleanup (faster than waiting for ticker)
+	rl.cleanup()
+
+	// Verify entries were cleaned up
+	count = 0
+	rl.limiters.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	if count != 0 {
+		t.Errorf("expected 0 entries after cleanup, got %d", count)
+	}
+}
+
+func TestRateLimiterCleanupPreservesActive(t *testing.T) {
+	// Use a 2-second TTL for testing (lastSeen uses Unix seconds)
+	rl := newIPRateLimiterWithTTL(10, 5, 2*time.Second)
+	defer rl.Stop()
+
+	// Add a stale IP first
+	rl.getLimiter("192.168.1.2")
+
+	// Wait for the stale IP to age past TTL
+	time.Sleep(3 * time.Second)
+
+	// Now add an active IP (will have recent lastSeen)
+	rl.getLimiter("192.168.1.1")
+
+	// Trigger cleanup - stale one should be removed, fresh one should remain
+	rl.cleanup()
+
+	var remaining []string
+	rl.limiters.Range(func(key, _ any) bool {
+		remaining = append(remaining, key.(string))
+		return true
+	})
+
+	if len(remaining) != 1 || remaining[0] != "192.168.1.1" {
+		t.Errorf("expected only 192.168.1.1 to remain, got: %v", remaining)
+	}
+}
+
+func TestRateLimiterStop(t *testing.T) {
+	rl := newIPRateLimiterWithTTL(10, 5, 10*time.Millisecond)
+
+	// Calling Stop multiple times should not panic
+	rl.Stop()
+	rl.Stop()
 }
 
 func TestHandler_Download_Expired(t *testing.T) {
@@ -445,7 +521,7 @@ func TestHandler_GetInvoice(t *testing.T) {
 	filesSvc := files.NewService(storage, st)
 	paymentsSvc := payments.NewService(lnd, st)
 
-	handler := NewHandler(filesSvc, paymentsSvc)
+	handler := NewHandler(filesSvc, paymentsSvc, nil)
 
 	// Create an invoice for a file
 	ctx := context.Background()
@@ -624,5 +700,231 @@ func TestExtractIP(t *testing.T) {
 				t.Errorf("extractIP() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// Helper to upload a file and wait for completion
+func uploadFileWithIP(t *testing.T, handler *Handler, ip string) (*UploadProgressResponse, int) {
+	t.Helper()
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, _ := writer.CreateFormFile("file", "test.txt")
+	part.Write([]byte("test content for pending limit"))
+	writer.Close()
+
+	req := httptest.NewRequest("POST", "/api/upload", &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("X-Forwarded-For", ip)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		return nil, rec.Code
+	}
+
+	var startResp UploadStartResponse
+	if err := json.NewDecoder(rec.Body).Decode(&startResp); err != nil {
+		t.Fatalf("failed to decode start response: %v", err)
+	}
+
+	// Poll for completion
+	for i := 0; i < 50; i++ {
+		req := httptest.NewRequest("GET", "/api/upload/"+startResp.UploadID+"/progress", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		var progress UploadProgressResponse
+		if err := json.NewDecoder(rec.Body).Decode(&progress); err != nil {
+			t.Fatalf("failed to decode progress: %v", err)
+		}
+
+		if progress.Status == "complete" {
+			return &progress, http.StatusOK
+		}
+		if progress.Status == "error" {
+			t.Fatalf("upload failed: %s", progress.Error)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	t.Fatal("upload did not complete in time")
+	return nil, 0
+}
+
+func TestHandler_Upload_PendingLimit(t *testing.T) {
+	storage := newMockStorage()
+	st := newMockStore()
+	lnd := payments.NewMockLNDClient()
+
+	filesSvc := files.NewService(storage, st)
+	paymentsSvc := payments.NewService(lnd, st)
+	pendingLimiter := NewPendingFileLimiter(2) // Low limit for testing
+
+	handler := NewHandler(filesSvc, paymentsSvc, pendingLimiter)
+
+	ip := "10.0.0.99"
+
+	// First two uploads should succeed
+	for i := 0; i < 2; i++ {
+		resp, code := uploadFileWithIP(t, handler, ip)
+		if code != http.StatusOK {
+			t.Fatalf("upload %d failed with code %d", i+1, code)
+		}
+		if resp == nil || resp.Result == nil {
+			t.Fatalf("upload %d did not complete", i+1)
+		}
+	}
+
+	// Third upload should be blocked
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, _ := writer.CreateFormFile("file", "test.txt")
+	part.Write([]byte("blocked content"))
+	writer.Close()
+
+	req := httptest.NewRequest("POST", "/api/upload", &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("X-Forwarded-For", ip)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("expected 429 for 3rd upload, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Verify error message contains helpful info
+	body := rec.Body.String()
+	if !bytes.Contains([]byte(body), []byte("pending file limit")) {
+		t.Error("error message should mention pending file limit")
+	}
+	if !bytes.Contains([]byte(body), []byte("2")) {
+		t.Error("error message should mention count")
+	}
+}
+
+func TestHandler_Upload_PendingLimit_DifferentIPs(t *testing.T) {
+	storage := newMockStorage()
+	st := newMockStore()
+	lnd := payments.NewMockLNDClient()
+
+	filesSvc := files.NewService(storage, st)
+	paymentsSvc := payments.NewService(lnd, st)
+	pendingLimiter := NewPendingFileLimiter(2)
+
+	handler := NewHandler(filesSvc, paymentsSvc, pendingLimiter)
+
+	// Fill up limit for IP1
+	for i := 0; i < 2; i++ {
+		_, code := uploadFileWithIP(t, handler, "10.0.0.1")
+		if code != http.StatusOK {
+			t.Fatalf("upload for IP1 failed")
+		}
+	}
+
+	// IP2 should still be able to upload
+	_, code := uploadFileWithIP(t, handler, "10.0.0.2")
+	if code != http.StatusOK {
+		t.Errorf("IP2 should be able to upload, got %d", code)
+	}
+}
+
+func TestHandler_Upload_PendingLimit_ClearsOnPayment(t *testing.T) {
+	storage := newMockStorage()
+	st := newMockStore()
+	lnd := payments.NewMockLNDClient()
+
+	filesSvc := files.NewService(storage, st)
+	paymentsSvc := payments.NewService(lnd, st)
+	pendingLimiter := NewPendingFileLimiter(1) // Very strict limit
+
+	// Wire up the callback
+	paymentsSvc.SetPaymentCallback(pendingLimiter.OnPaymentReceived)
+
+	// Start payment watcher so it can receive simulated payments
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := paymentsSvc.StartPaymentWatcher(ctx); err != nil {
+		t.Fatalf("failed to start payment watcher: %v", err)
+	}
+
+	handler := NewHandler(filesSvc, paymentsSvc, pendingLimiter)
+
+	ip := "10.0.0.50"
+
+	// Upload first file
+	resp, code := uploadFileWithIP(t, handler, ip)
+	if code != http.StatusOK {
+		t.Fatalf("first upload failed with code %d", code)
+	}
+	if resp == nil || resp.Result == nil {
+		t.Fatal("first upload did not complete")
+	}
+
+	fileID := resp.Result.FileID
+	paymentHash := resp.Result.PaymentHash
+
+	// Second upload should be blocked
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, _ := writer.CreateFormFile("file", "blocked.txt")
+	part.Write([]byte("should be blocked"))
+	writer.Close()
+
+	req := httptest.NewRequest("POST", "/api/upload", &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("X-Forwarded-For", ip)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 before payment, got %d", rec.Code)
+	}
+
+	// Simulate payment
+	lnd.SimulatePayment(paymentHash)
+
+	// Give the payment handler time to process
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify file is marked as paid
+	meta, err := st.GetFileMetadata(context.Background(), fileID)
+	if err != nil {
+		t.Fatalf("failed to get metadata: %v", err)
+	}
+	if !meta.Paid {
+		t.Error("file should be marked as paid")
+	}
+
+	// Now upload should succeed
+	resp2, code2 := uploadFileWithIP(t, handler, ip)
+	if code2 != http.StatusOK {
+		t.Errorf("upload after payment should succeed, got %d", code2)
+	}
+	if resp2 == nil || resp2.Result == nil {
+		t.Error("upload after payment did not complete")
+	}
+}
+
+func TestHandler_Upload_NoPendingLimiter(t *testing.T) {
+	// Test that handler works when no limiter is configured
+	storage := newMockStorage()
+	st := newMockStore()
+	lnd := payments.NewMockLNDClient()
+
+	filesSvc := files.NewService(storage, st)
+	paymentsSvc := payments.NewService(lnd, st)
+
+	handler := NewHandler(filesSvc, paymentsSvc, nil) // No limiter
+
+	// Should be able to upload many files
+	for i := 0; i < 5; i++ {
+		_, code := uploadFileWithIP(t, handler, "10.0.0.1")
+		if code != http.StatusOK {
+			t.Errorf("upload %d should succeed without limiter, got %d", i+1, code)
+		}
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"regexp"
@@ -30,6 +31,7 @@ type backgroundUpload struct {
 	data         []byte          // file data to upload
 	size         int64           // file size
 	createdAt    time.Time       // when the upload started
+	uploaderIP   string          // IP address of uploader (for rate limiting)
 }
 
 // backgroundUploads stores all in-progress background uploads.
@@ -45,15 +47,18 @@ type Handler struct {
 	files          *files.Service
 	payments       *payments.Service
 	webhookHandler WebhookHandler
+	pendingLimiter *PendingFileLimiter
 	mux            *http.ServeMux
 }
 
 // NewHandler creates a new HTTP handler.
-func NewHandler(files *files.Service, payments *payments.Service) *Handler {
+// If pendingLimiter is nil, no pending file limit is enforced.
+func NewHandler(files *files.Service, payments *payments.Service, pendingLimiter *PendingFileLimiter) *Handler {
 	h := &Handler{
-		files:    files,
-		payments: payments,
-		mux:      http.NewServeMux(),
+		files:          files,
+		payments:       payments,
+		pendingLimiter: pendingLimiter,
+		mux:            http.NewServeMux(),
 	}
 	h.registerRoutes()
 	return h
@@ -109,6 +114,19 @@ type UploadProgressResponse struct {
 const MaxUploadSize = 5 << 30
 
 func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
+	// Extract client IP for rate limiting
+	ip := extractIP(r)
+
+	// Check pending file limit before accepting upload
+	if h.pendingLimiter != nil && !h.pendingLimiter.CanUpload(ip) {
+		count := h.pendingLimiter.PendingCount(ip)
+		max := h.pendingLimiter.MaxPending()
+		msg := fmt.Sprintf("pending file limit reached: you have %d unpaid file(s) (max %d). "+
+			"Please pay for or wait for existing files to expire before uploading more.", count, max)
+		http.Error(w, msg, http.StatusTooManyRequests)
+		return
+	}
+
 	// Limit upload size to 5GB
 	r.Body = http.MaxBytesReader(w, r.Body, MaxUploadSize)
 
@@ -144,11 +162,12 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	// Create background upload tracker
 	upload := &backgroundUpload{
-		status:    "uploading",
-		progress:  0,
-		data:      buf.Bytes(),
-		size:      fileSize,
-		createdAt: time.Now(),
+		status:     "uploading",
+		progress:   0,
+		data:       buf.Bytes(),
+		size:       fileSize,
+		createdAt:  time.Now(),
+		uploaderIP: ip,
 	}
 	backgroundUploads.Store(uploadID, upload)
 
@@ -207,6 +226,11 @@ func (h *Handler) processBackgroundUpload(uploadID string, upload *backgroundUpl
 		upload.data = nil
 		upload.mu.Unlock()
 		return
+	}
+
+	// Track pending file for rate limiting (using IP stored in upload)
+	if h.pendingLimiter != nil && upload.uploaderIP != "" {
+		h.pendingLimiter.TrackPendingFile(upload.uploaderIP, result.ID)
 	}
 
 	// Mark as complete
