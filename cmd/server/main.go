@@ -60,6 +60,14 @@ func printStats(st *store.SQLiteStore) {
 	} else {
 		fmt.Println("║  No files in database                    ║")
 	}
+	if len(stats.DailyStats) > 0 {
+		fmt.Println("╠══════════════════════════════════════════╣")
+		fmt.Println("║  Paid Files (last 14 days)               ║")
+		fmt.Println("║  ──────────────────────────────────────  ║")
+		for _, ds := range stats.DailyStats {
+			fmt.Printf("║  %s:    %3d files  %12s  ║\n", ds.Date, ds.PaidFiles, formatBytes(ds.PaidBytes))
+		}
+	}
 	fmt.Println("╚══════════════════════════════════════════╝")
 }
 

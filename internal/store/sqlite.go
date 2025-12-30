@@ -206,6 +206,31 @@ func (s *SQLiteStore) GetStats(ctx context.Context) (*Stats, error) {
 		}
 	}
 
+	// Get daily stats for the last 14 days
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT
+			date(created_at) as day,
+			COUNT(*) as paid_count,
+			COALESCE(SUM(size), 0) as paid_bytes
+		FROM files
+		WHERE paid = 1
+		AND created_at >= date('now', '-14 days')
+		GROUP BY date(created_at)
+		ORDER BY day DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var ds DailyStat
+		if err := rows.Scan(&ds.Date, &ds.PaidFiles, &ds.PaidBytes); err != nil {
+			return nil, err
+		}
+		stats.DailyStats = append(stats.DailyStats, ds)
+	}
+
 	return stats, nil
 }
 

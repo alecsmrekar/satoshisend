@@ -15,6 +15,13 @@ type FileMeta struct {
 	CreatedAt    time.Time
 }
 
+// DailyStat contains statistics for a single day.
+type DailyStat struct {
+	Date      string
+	PaidFiles int
+	PaidBytes int64
+}
+
 // Stats contains aggregate statistics about stored files.
 type Stats struct {
 	TotalFiles   int
@@ -26,6 +33,7 @@ type Stats struct {
 	PendingBytes int64
 	OldestFile   time.Time
 	NewestFile   time.Time
+	DailyStats   []DailyStat
 }
 
 // Store defines the interface for metadata persistence.
