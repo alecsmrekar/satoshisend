@@ -54,12 +54,16 @@ export async function encryptFile(file, key, onProgress) {
         // Derive IV for this chunk
         const chunkIV = deriveChunkIV(baseIV, i);
 
-        // For the first chunk, include header as AAD to authenticate it
-        const aad = (i === 0) ? headerBytes : undefined;
+        // Build encrypt params - only include additionalData for chunk 0
+        // Chrome requires additionalData to be omitted (not undefined) when not used
+        const encryptParams = { name: 'AES-GCM', iv: chunkIV };
+        if (i === 0) {
+            encryptParams.additionalData = headerBytes;
+        }
 
         // Encrypt chunk
         const encryptedChunk = await crypto.subtle.encrypt(
-            { name: 'AES-GCM', iv: chunkIV, additionalData: aad },
+            encryptParams,
             key,
             chunkData
         );
