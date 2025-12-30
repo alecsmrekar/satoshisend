@@ -205,6 +205,8 @@ func (c *AlbyHTTPClient) verifyWebhookSignature(body []byte, headers http.Header
 	svixTimestamp := headers.Get("svix-timestamp")
 	svixSignature := headers.Get("svix-signature")
 
+	logging.Alby.Printf("webhook: svix-id=%s timestamp=%s sig=%s...", svixID, svixTimestamp, truncate(svixSignature, 20))
+
 	if svixID == "" || svixTimestamp == "" || svixSignature == "" {
 		return fmt.Errorf("missing SVIX headers")
 	}
@@ -258,4 +260,11 @@ func parseTimestamp(ts string) (time.Time, error) {
 		return time.Time{}, err
 	}
 	return time.Unix(unix, 0), nil
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
