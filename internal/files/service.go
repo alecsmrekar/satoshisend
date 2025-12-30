@@ -8,6 +8,7 @@ import (
 	"io"
 	"time"
 
+	"satoshisend/internal/logging"
 	"satoshisend/internal/store"
 )
 
@@ -157,6 +158,8 @@ func (s *Service) MarkPaid(ctx context.Context, id string) error {
 }
 
 // CleanupExpired removes expired files from storage and database.
+// It continues processing other files even if some deletions fail,
+// but logs errors to detect infrastructure issues.
 func (s *Service) CleanupExpired(ctx context.Context) (int, error) {
 	expired, err := s.store.ListExpiredFiles(ctx)
 	if err != nil {
@@ -164,15 +167,27 @@ func (s *Service) CleanupExpired(ctx context.Context) (int, error) {
 	}
 
 	count := 0
+	storageErrors := 0
+	metadataErrors := 0
+
 	for _, meta := range expired {
 		if err := s.storage.Delete(ctx, meta.ID); err != nil && err != ErrNotFound {
+			storageErrors++
+			logging.Internal.Printf("failed to delete file %s from storage: %v", meta.ID, err)
 			continue
 		}
 		if err := s.store.DeleteFileMetadata(ctx, meta.ID); err != nil {
+			metadataErrors++
+			logging.Internal.Printf("failed to delete metadata for file %s: %v", meta.ID, err)
 			continue
 		}
 		count++
 	}
+
+	if storageErrors > 0 || metadataErrors > 0 {
+		logging.Internal.Printf("cleanup completed with errors: %d storage failures, %d metadata failures", storageErrors, metadataErrors)
+	}
+
 	return count, nil
 }
 
