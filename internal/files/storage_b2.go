@@ -12,9 +12,41 @@ import (
 
 const b2Endpoint = "s3.us-east-005.backblazeb2.com"
 
+// B2Object wraps the operations needed from an S3 object.
+// This abstraction allows for mocking in tests.
+type B2Object interface {
+	io.ReadCloser
+	Stat() (minio.ObjectInfo, error)
+}
+
+// B2Client defines the interface for S3-compatible storage operations.
+// This abstraction allows for mocking in tests.
+type B2Client interface {
+	PutObject(ctx context.Context, bucketName, objectName string, reader io.Reader, objectSize int64, opts minio.PutObjectOptions) (minio.UploadInfo, error)
+	GetObject(ctx context.Context, bucketName, objectName string, opts minio.GetObjectOptions) (B2Object, error)
+	RemoveObject(ctx context.Context, bucketName, objectName string, opts minio.RemoveObjectOptions) error
+}
+
+// minioClientWrapper wraps *minio.Client to implement B2Client.
+type minioClientWrapper struct {
+	client *minio.Client
+}
+
+func (w *minioClientWrapper) PutObject(ctx context.Context, bucketName, objectName string, reader io.Reader, objectSize int64, opts minio.PutObjectOptions) (minio.UploadInfo, error) {
+	return w.client.PutObject(ctx, bucketName, objectName, reader, objectSize, opts)
+}
+
+func (w *minioClientWrapper) GetObject(ctx context.Context, bucketName, objectName string, opts minio.GetObjectOptions) (B2Object, error) {
+	return w.client.GetObject(ctx, bucketName, objectName, opts)
+}
+
+func (w *minioClientWrapper) RemoveObject(ctx context.Context, bucketName, objectName string, opts minio.RemoveObjectOptions) error {
+	return w.client.RemoveObject(ctx, bucketName, objectName, opts)
+}
+
 // B2Storage implements Storage using Backblaze B2 via S3-compatible API.
 type B2Storage struct {
-	client    *minio.Client
+	client    B2Client
 	bucket    string
 	prefix    string
 	publicURL string // Base URL for public access (e.g., "https://f005.backblazeb2.com/file/mybucket")
@@ -48,11 +80,22 @@ func NewB2Storage(cfg B2Config) (*B2Storage, error) {
 
 	logging.B2.Printf("storage initialized successfully")
 	return &B2Storage{
-		client:    client,
+		client:    &minioClientWrapper{client: client},
 		bucket:    cfg.Bucket,
 		prefix:    cfg.Prefix,
 		publicURL: cfg.PublicURL,
 	}, nil
+}
+
+// NewB2StorageWithClient creates a B2Storage with a custom client.
+// This is primarily useful for testing with mock clients.
+func NewB2StorageWithClient(client B2Client, bucket, prefix, publicURL string) *B2Storage {
+	return &B2Storage{
+		client:    client,
+		bucket:    bucket,
+		prefix:    prefix,
+		publicURL: publicURL,
+	}
 }
 
 func (s *B2Storage) key(id string) string {
