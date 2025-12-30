@@ -388,3 +388,241 @@ func TestRateLimit(t *testing.T) {
 		}
 	})
 }
+
+func TestHandler_Download_Expired(t *testing.T) {
+	handler, st := setupTestHandler()
+
+	// Create an expired file
+	st.SaveFileMetadata(context.Background(), &store.FileMeta{
+		ID:        "expiredfile12345",
+		Size:      100,
+		ExpiresAt: time.Now().Add(-1 * time.Hour), // Expired
+		Paid:      true,
+		CreatedAt: time.Now().Add(-25 * time.Hour),
+	})
+
+	req := httptest.NewRequest("GET", "/api/file/expiredfile12345", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusGone {
+		t.Errorf("expected 410 Gone, got %d", rec.Code)
+	}
+}
+
+func TestHandler_Download_NotFound(t *testing.T) {
+	handler, _ := setupTestHandler()
+
+	req := httptest.NewRequest("GET", "/api/file/nonexistentfile1", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", rec.Code)
+	}
+}
+
+func TestHandler_Status_NotFound(t *testing.T) {
+	handler, _ := setupTestHandler()
+
+	req := httptest.NewRequest("GET", "/api/file/nonexistent123/status", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", rec.Code)
+	}
+}
+
+func TestHandler_GetInvoice(t *testing.T) {
+	storage := newMockStorage()
+	st := newMockStore()
+	lnd := payments.NewMockLNDClient()
+
+	filesSvc := files.NewService(storage, st)
+	paymentsSvc := payments.NewService(lnd, st)
+
+	handler := NewHandler(filesSvc, paymentsSvc)
+
+	// Create an invoice for a file
+	ctx := context.Background()
+	st.SaveFileMetadata(ctx, &store.FileMeta{
+		ID:        "invoicetest12345",
+		Size:      1024,
+		ExpiresAt: time.Now().Add(1 * time.Hour),
+		Paid:      false,
+		CreatedAt: time.Now(),
+	})
+
+	// Create invoice through payment service
+	_, err := paymentsSvc.CreateInvoiceForFile(ctx, "invoicetest12345", 100)
+	if err != nil {
+		t.Fatalf("failed to create invoice: %v", err)
+	}
+
+	t.Run("get existing invoice", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/file/invoicetest12345/invoice", nil)
+		rec := httptest.NewRecorder()
+
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+		}
+
+		var resp InvoiceResponse
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+
+		if resp.PaymentRequest == "" {
+			t.Error("expected payment request")
+		}
+		if resp.AmountSats != 100 {
+			t.Errorf("expected 100 sats, got %d", resp.AmountSats)
+		}
+	})
+
+	t.Run("get nonexistent invoice", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/file/noinvoice123456/invoice", nil)
+		rec := httptest.NewRecorder()
+
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("expected 404, got %d", rec.Code)
+		}
+	})
+}
+
+// mockWebhookHandler implements WebhookHandler for testing
+type mockWebhookHandler struct {
+	lastBody    []byte
+	lastHeaders http.Header
+	returnError error
+}
+
+func (m *mockWebhookHandler) HandleWebhook(body []byte, headers http.Header) error {
+	m.lastBody = body
+	m.lastHeaders = headers
+	return m.returnError
+}
+
+func TestHandler_AlbyWebhook(t *testing.T) {
+	handler, _ := setupTestHandler()
+
+	t.Run("no webhook handler configured", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/api/webhook/alby", bytes.NewReader([]byte(`{}`)))
+		rec := httptest.NewRecorder()
+
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("expected 503, got %d", rec.Code)
+		}
+	})
+
+	t.Run("with webhook handler success", func(t *testing.T) {
+		mockWH := &mockWebhookHandler{}
+		handler.SetWebhookHandler(mockWH)
+
+		body := `{"payment_hash":"abc123","settled":true}`
+		req := httptest.NewRequest("POST", "/api/webhook/alby", bytes.NewReader([]byte(body)))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d", rec.Code)
+		}
+
+		if string(mockWH.lastBody) != body {
+			t.Errorf("expected body %q, got %q", body, string(mockWH.lastBody))
+		}
+	})
+
+	t.Run("with webhook handler error", func(t *testing.T) {
+		mockWH := &mockWebhookHandler{
+			returnError: io.EOF, // Any error
+		}
+		handler.SetWebhookHandler(mockWH)
+
+		req := httptest.NewRequest("POST", "/api/webhook/alby", bytes.NewReader([]byte(`{}`)))
+		rec := httptest.NewRecorder()
+
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("expected 400, got %d", rec.Code)
+		}
+	})
+}
+
+func TestHandler_UploadProgress_NotFound(t *testing.T) {
+	handler, _ := setupTestHandler()
+
+	req := httptest.NewRequest("GET", "/api/upload/nonexistent123/progress", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", rec.Code)
+	}
+}
+
+func TestDefaultRateLimitConfig(t *testing.T) {
+	cfg := DefaultRateLimitConfig()
+
+	if cfg.RequestsPerSecond <= 0 {
+		t.Error("RequestsPerSecond should be positive")
+	}
+	if cfg.BurstSize <= 0 {
+		t.Error("BurstSize should be positive")
+	}
+	if cfg.UploadRequestsPerMinute <= 0 {
+		t.Error("UploadRequestsPerMinute should be positive")
+	}
+	if cfg.UploadBurstSize <= 0 {
+		t.Error("UploadBurstSize should be positive")
+	}
+}
+
+func TestExtractIP(t *testing.T) {
+	tests := []struct {
+		name       string
+		remoteAddr string
+		xff        string
+		xri        string
+		want       string
+	}{
+		{"remote addr only", "192.168.1.1:12345", "", "", "192.168.1.1"},
+		{"X-Forwarded-For single", "127.0.0.1:80", "203.0.113.50", "", "203.0.113.50"},
+		{"X-Forwarded-For chain", "127.0.0.1:80", "203.0.113.50, 70.41.3.18", "", "203.0.113.50"},
+		{"X-Real-IP", "127.0.0.1:80", "", "203.0.113.100", "203.0.113.100"},
+		{"X-Forwarded-For takes precedence", "127.0.0.1:80", "1.2.3.4", "5.6.7.8", "1.2.3.4"},
+		{"IPv6", "[::1]:8080", "", "", "[::1]"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/", nil)
+			req.RemoteAddr = tc.remoteAddr
+			if tc.xff != "" {
+				req.Header.Set("X-Forwarded-For", tc.xff)
+			}
+			if tc.xri != "" {
+				req.Header.Set("X-Real-IP", tc.xri)
+			}
+
+			got := extractIP(req)
+			if got != tc.want {
+				t.Errorf("extractIP() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

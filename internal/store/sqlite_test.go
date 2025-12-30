@@ -143,3 +143,81 @@ func TestSQLiteStore(t *testing.T) {
 		}
 	})
 }
+
+func TestSQLiteStore_GetStats(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	t.Run("empty database", func(t *testing.T) {
+		stats, err := store.GetStats(ctx)
+		if err != nil {
+			t.Fatalf("GetStats failed: %v", err)
+		}
+
+		if stats.TotalFiles != 0 {
+			t.Errorf("expected 0 total files, got %d", stats.TotalFiles)
+		}
+		if stats.TotalBytes != 0 {
+			t.Errorf("expected 0 total bytes, got %d", stats.TotalBytes)
+		}
+	})
+
+	t.Run("with files", func(t *testing.T) {
+		// Add paid file
+		paid := &FileMeta{
+			ID:           "stats-paid-file",
+			Size:         1024,
+			ExpiresAt:    time.Now().Add(24 * time.Hour),
+			HostDuration: 24 * time.Hour,
+			Paid:         true,
+			CreatedAt:    time.Now().Add(-1 * time.Hour),
+		}
+		store.SaveFileMetadata(ctx, paid)
+
+		// Add pending file
+		pending := &FileMeta{
+			ID:           "stats-pending-file",
+			Size:         2048,
+			ExpiresAt:    time.Now().Add(1 * time.Hour),
+			HostDuration: 24 * time.Hour,
+			Paid:         false,
+			CreatedAt:    time.Now(),
+		}
+		store.SaveFileMetadata(ctx, pending)
+
+		stats, err := store.GetStats(ctx)
+		if err != nil {
+			t.Fatalf("GetStats failed: %v", err)
+		}
+
+		if stats.TotalFiles != 2 {
+			t.Errorf("expected 2 total files, got %d", stats.TotalFiles)
+		}
+		if stats.PaidFiles != 1 {
+			t.Errorf("expected 1 paid file, got %d", stats.PaidFiles)
+		}
+		if stats.PendingFiles != 1 {
+			t.Errorf("expected 1 pending file, got %d", stats.PendingFiles)
+		}
+		if stats.TotalBytes != 1024+2048 {
+			t.Errorf("expected %d total bytes, got %d", 1024+2048, stats.TotalBytes)
+		}
+		if stats.PaidBytes != 1024 {
+			t.Errorf("expected %d paid bytes, got %d", 1024, stats.PaidBytes)
+		}
+		if stats.PendingBytes != 2048 {
+			t.Errorf("expected %d pending bytes, got %d", 2048, stats.PendingBytes)
+		}
+		if stats.OldestFile.IsZero() {
+			t.Error("expected OldestFile to be set")
+		}
+		if stats.NewestFile.IsZero() {
+			t.Error("expected NewestFile to be set")
+		}
+	})
+}
