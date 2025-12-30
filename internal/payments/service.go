@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	"satoshisend/internal/logging"
 	"satoshisend/internal/store"
@@ -57,6 +58,19 @@ func (s *Service) CreateInvoiceForFile(ctx context.Context, fileID string, amoun
 		FileID:      fileID,
 		PaymentHash: inv.PaymentHash,
 		Invoice:     inv,
+	}
+
+	// Persist to database for restart recovery
+	storeInv := &store.PendingInvoice{
+		PaymentHash:    inv.PaymentHash,
+		FileID:         fileID,
+		PaymentRequest: inv.PaymentRequest,
+		AmountSats:     amountSats,
+		CreatedAt:      time.Now(),
+	}
+	if err := s.store.SavePendingInvoice(ctx, storeInv); err != nil {
+		logging.Internal.Printf("failed to persist invoice %s: %v", inv.PaymentHash[:16], err)
+		// Continue anyway - in-memory tracking still works
 	}
 
 	s.mu.Lock()
@@ -126,6 +140,11 @@ func (s *Service) handlePayment(ctx context.Context, paymentHash string) {
 	s.mu.Unlock()
 
 	if ok {
+		// Remove from persistent storage
+		if err := s.store.DeletePendingInvoice(ctx, paymentHash); err != nil {
+			logging.Internal.Printf("failed to delete pending invoice %s: %v", paymentHash[:16], err)
+		}
+
 		if err := s.store.UpdatePaymentStatus(ctx, pending.FileID, true); err != nil {
 			logging.Internal.Printf("CRITICAL: failed to mark file %s as paid after receiving payment: %v", pending.FileID, err)
 		}
@@ -142,4 +161,36 @@ func (s *Service) handlePayment(ctx context.Context, paymentHash string) {
 			}()
 		}
 	}
+}
+
+// LoadPendingInvoices loads pending invoices from the database into memory.
+// This should be called on startup to recover state after a restart.
+func (s *Service) LoadPendingInvoices(ctx context.Context) error {
+	invoices, err := s.store.ListPendingInvoices(ctx)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, inv := range invoices {
+		pending := &PendingInvoice{
+			FileID:      inv.FileID,
+			PaymentHash: inv.PaymentHash,
+			Invoice: &Invoice{
+				PaymentHash:    inv.PaymentHash,
+				PaymentRequest: inv.PaymentRequest,
+				AmountSats:     inv.AmountSats,
+			},
+		}
+		s.pending[inv.PaymentHash] = pending
+		s.byFileID[inv.FileID] = pending
+	}
+
+	if len(invoices) > 0 {
+		logging.Internal.Printf("loaded %d pending invoices from database", len(invoices))
+	}
+
+	return nil
 }

@@ -21,10 +21,9 @@ const albyAPIBase = "https://api.getalby.com"
 // AlbyHTTPClient implements LNDClient using the Alby Wallet HTTP API.
 // This connects to Alby's custodial wallet service and uses webhooks for payment notifications.
 type AlbyHTTPClient struct {
-	accessToken     string
-	httpClient      *http.Client
-	webhookSecret   string
-	webhookEndpoint string // The Alby webhook endpoint ID for cleanup
+	accessToken   string
+	httpClient    *http.Client
+	webhookSecret string
 
 	updates chan InvoiceUpdate
 	done    chan struct{}
@@ -45,40 +44,29 @@ type albyInvoiceResponse struct {
 	SettledAt      string `json:"settled_at,omitempty"`
 }
 
-type albyWebhookRequest struct {
-	URL         string   `json:"url"`
-	Description string   `json:"description,omitempty"`
-	FilterTypes []string `json:"filter_types"`
-}
-
-type albyWebhookResponse struct {
-	ID             string `json:"id"`
-	EndpointSecret string `json:"endpoint_secret"`
-	URL            string `json:"url"`
-}
-
 // AlbyConfig holds configuration for the Alby HTTP client.
 type AlbyConfig struct {
-	AccessToken string
-	WebhookURL  string // The public URL where Alby will send webhook notifications
+	AccessToken   string
+	WebhookSecret string // The SVIX webhook secret from your Alby webhook endpoint
 }
 
 // NewAlbyHTTPClient creates a new Alby HTTP API client with webhook support.
-// The webhookURL must be publicly accessible for Alby to send payment notifications.
+// The webhook must be pre-registered with Alby and the secret provided in config.
 func NewAlbyHTTPClient(cfg AlbyConfig) (*AlbyHTTPClient, error) {
 	if cfg.AccessToken == "" {
 		return nil, fmt.Errorf("access token is required")
 	}
-	if cfg.WebhookURL == "" {
-		return nil, fmt.Errorf("webhook URL is required")
+	if cfg.WebhookSecret == "" {
+		return nil, fmt.Errorf("webhook secret is required")
 	}
 
 	c := &AlbyHTTPClient{
-		accessToken: cfg.AccessToken,
+		accessToken:   cfg.AccessToken,
+		webhookSecret: cfg.WebhookSecret,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		updates: make(chan InvoiceUpdate, 100),
+		updates: make(chan InvoiceUpdate, 1000),
 		done:    make(chan struct{}),
 	}
 
@@ -88,13 +76,6 @@ func NewAlbyHTTPClient(cfg AlbyConfig) (*AlbyHTTPClient, error) {
 		return nil, fmt.Errorf("failed to connect to Alby: %w", err)
 	}
 	logging.Alby.Println("connected successfully!")
-
-	// Register webhook for invoice settlements
-	logging.Alby.Printf("registering webhook at %s...", cfg.WebhookURL)
-	if err := c.registerWebhook(cfg.WebhookURL); err != nil {
-		return nil, fmt.Errorf("failed to register webhook: %w", err)
-	}
-	logging.Alby.Println("webhook registered successfully!")
 
 	return c, nil
 }
@@ -117,48 +98,6 @@ func (c *AlbyHTTPClient) testConnection() error {
 		return fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
 	}
 
-	return nil
-}
-
-func (c *AlbyHTTPClient) registerWebhook(webhookURL string) error {
-	reqBody := albyWebhookRequest{
-		URL:         webhookURL,
-		Description: "SatoshiSend invoice notifications",
-		FilterTypes: []string{"invoice.incoming.settled"},
-	}
-
-	jsonBody, err := json.Marshal(reqBody)
-	if err != nil {
-		return fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", albyAPIBase+"/webhook_endpoints", bytes.NewReader(jsonBody))
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.accessToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var webhookResp albyWebhookResponse
-	if err := json.NewDecoder(resp.Body).Decode(&webhookResp); err != nil {
-		return fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	c.webhookSecret = webhookResp.EndpointSecret
-	c.webhookEndpoint = webhookResp.ID
-
-	logging.Alby.Printf("webhook endpoint created with ID %s", webhookResp.ID)
 	return nil
 }
 
@@ -215,23 +154,6 @@ func (c *AlbyHTTPClient) SubscribeInvoices(ctx context.Context) (<-chan InvoiceU
 
 func (c *AlbyHTTPClient) Close() error {
 	close(c.done)
-
-	// Clean up webhook endpoint
-	if c.webhookEndpoint != "" {
-		logging.Alby.Printf("deleting webhook endpoint %s...", c.webhookEndpoint)
-		req, err := http.NewRequest("DELETE", albyAPIBase+"/webhook_endpoints/"+c.webhookEndpoint, nil)
-		if err == nil {
-			req.Header.Set("Authorization", "Bearer "+c.accessToken)
-			resp, err := c.httpClient.Do(req)
-			if err == nil {
-				resp.Body.Close()
-				if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
-					logging.Alby.Println("webhook endpoint deleted")
-				}
-			}
-		}
-	}
-
 	return nil
 }
 
@@ -267,10 +189,8 @@ func (c *AlbyHTTPClient) HandleWebhook(body []byte, headers http.Header) error {
 		}:
 			logging.Alby.Printf("webhook: queued payment %s (buffer: %d/%d)", payload.PaymentHash[:16], len(c.updates), cap(c.updates))
 		default:
-			// CRITICAL: Payment notification is DROPPED, not delayed!
-			// The user has paid but their file will not be activated.
-			// TODO: Implement proper persistence/retry mechanism if this ever occurs.
-			logging.Alby.Printf("webhook: CRITICAL - update channel full (%d/%d), payment %s LOST! User paid but file will not activate. Payment hash: %s",
+			// Payment dropped from channel - will be recovered from DB on next webhook or restart
+			logging.Alby.Printf("webhook: WARNING - update channel full (%d/%d), payment %s not queued (persisted to DB). Payment hash: %s",
 				len(c.updates), cap(c.updates), payload.PaymentHash[:16], payload.PaymentHash)
 		}
 	}

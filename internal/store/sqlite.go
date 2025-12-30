@@ -52,6 +52,20 @@ func migrate(db *sql.DB) error {
 	// Add host_duration_ns column if it doesn't exist (migration for existing DBs)
 	_, _ = db.Exec(`ALTER TABLE files ADD COLUMN host_duration_ns INTEGER NOT NULL DEFAULT 0`)
 
+	// Create pending_invoices table for restart recovery
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS pending_invoices (
+			payment_hash TEXT PRIMARY KEY,
+			file_id TEXT NOT NULL,
+			payment_request TEXT NOT NULL,
+			amount_sats INTEGER NOT NULL,
+			created_at DATETIME NOT NULL
+		)
+	`)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -232,6 +246,40 @@ func (s *SQLiteStore) GetStats(ctx context.Context) (*Stats, error) {
 	}
 
 	return stats, nil
+}
+
+func (s *SQLiteStore) SavePendingInvoice(ctx context.Context, inv *PendingInvoice) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT OR REPLACE INTO pending_invoices (payment_hash, file_id, payment_request, amount_sats, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, inv.PaymentHash, inv.FileID, inv.PaymentRequest, inv.AmountSats, inv.CreatedAt)
+	return err
+}
+
+func (s *SQLiteStore) DeletePendingInvoice(ctx context.Context, paymentHash string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM pending_invoices WHERE payment_hash = ?`, paymentHash)
+	return err
+}
+
+func (s *SQLiteStore) ListPendingInvoices(ctx context.Context) ([]*PendingInvoice, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT payment_hash, file_id, payment_request, amount_sats, created_at
+		FROM pending_invoices
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var invoices []*PendingInvoice
+	for rows.Next() {
+		var inv PendingInvoice
+		if err := rows.Scan(&inv.PaymentHash, &inv.FileID, &inv.PaymentRequest, &inv.AmountSats, &inv.CreatedAt); err != nil {
+			return nil, err
+		}
+		invoices = append(invoices, &inv)
+	}
+	return invoices, rows.Err()
 }
 
 func (s *SQLiteStore) Close() error {

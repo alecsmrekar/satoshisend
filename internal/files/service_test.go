@@ -53,11 +53,15 @@ func (m *mockStorage) Delete(ctx context.Context, id string) error {
 
 // mockStore implements store.Store for testing.
 type mockStore struct {
-	files map[string]*store.FileMeta
+	files    map[string]*store.FileMeta
+	invoices map[string]*store.PendingInvoice
 }
 
 func newMockStore() *mockStore {
-	return &mockStore{files: make(map[string]*store.FileMeta)}
+	return &mockStore{
+		files:    make(map[string]*store.FileMeta),
+		invoices: make(map[string]*store.PendingInvoice),
+	}
 }
 
 func (m *mockStore) SaveFileMetadata(ctx context.Context, meta *store.FileMeta) error {
@@ -111,6 +115,24 @@ func (m *mockStore) GetStats(ctx context.Context) (*store.Stats, error) {
 
 func (m *mockStore) Close() error {
 	return nil
+}
+
+func (m *mockStore) SavePendingInvoice(ctx context.Context, inv *store.PendingInvoice) error {
+	m.invoices[inv.PaymentHash] = inv
+	return nil
+}
+
+func (m *mockStore) DeletePendingInvoice(ctx context.Context, paymentHash string) error {
+	delete(m.invoices, paymentHash)
+	return nil
+}
+
+func (m *mockStore) ListPendingInvoices(ctx context.Context) ([]*store.PendingInvoice, error) {
+	var result []*store.PendingInvoice
+	for _, inv := range m.invoices {
+		result = append(result, inv)
+	}
+	return result, nil
 }
 
 func TestService_Upload(t *testing.T) {

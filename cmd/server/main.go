@@ -130,26 +130,30 @@ func main() {
 	var lndClient payments.LNDClient
 	var albyClient *payments.AlbyHTTPClient
 	albyToken := os.Getenv("ALBY_TOKEN")
-	if albyToken != "" {
-		webhookURL := os.Getenv("WEBHOOK_URL")
-		if webhookURL == "" {
-			webhookURL = "https://satoshisend.xyz/api/webhook/alby"
-		}
+	albyWebhookSecret := os.Getenv("ALBY_WEBHOOK_SECRET")
+	if albyToken != "" && albyWebhookSecret != "" {
 		var err error
 		albyClient, err = payments.NewAlbyHTTPClient(payments.AlbyConfig{
-			AccessToken: albyToken,
-			WebhookURL:  webhookURL,
+			AccessToken:   albyToken,
+			WebhookSecret: albyWebhookSecret,
 		})
 		if err != nil {
 			logging.Internal.Fatalf("failed to connect to Alby wallet: %v", err)
 		}
 		lndClient = albyClient
-		logging.Internal.Println("connected to Lightning wallet via Alby HTTP API (using webhooks)")
+		logging.Internal.Println("connected to Lightning wallet via Alby HTTP API")
+	} else if albyToken != "" {
+		logging.Internal.Fatalf("ALBY_TOKEN is set but ALBY_WEBHOOK_SECRET is missing (see README for webhook setup)")
 	} else {
 		lndClient = payments.NewMockLNDClient()
-		logging.Internal.Println("using mock LND client (set ALBY_TOKEN and WEBHOOK_URL for real payments)")
+		logging.Internal.Println("using mock LND client (set ALBY_TOKEN and ALBY_WEBHOOK_SECRET for real payments)")
 	}
 	paymentsSvc := payments.NewService(lndClient, st)
+
+	// Load pending invoices from database (restart recovery)
+	if err := paymentsSvc.LoadPendingInvoices(context.Background()); err != nil {
+		logging.Internal.Printf("warning: failed to load pending invoices: %v", err)
+	}
 
 	// Create pending file limiter (max 3 pending files per IP)
 	pendingLimiter := api.NewPendingFileLimiter(3)

@@ -144,6 +144,106 @@ func TestSQLiteStore(t *testing.T) {
 	})
 }
 
+func TestSQLiteStore_PendingInvoices(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	t.Run("SaveAndList", func(t *testing.T) {
+		inv := &PendingInvoice{
+			PaymentHash:    "abc123hash",
+			FileID:         "file-xyz",
+			PaymentRequest: "lnbc1000...",
+			AmountSats:     1000,
+			CreatedAt:      time.Now(),
+		}
+
+		if err := store.SavePendingInvoice(ctx, inv); err != nil {
+			t.Fatalf("failed to save invoice: %v", err)
+		}
+
+		invoices, err := store.ListPendingInvoices(ctx)
+		if err != nil {
+			t.Fatalf("failed to list invoices: %v", err)
+		}
+
+		if len(invoices) != 1 {
+			t.Fatalf("expected 1 invoice, got %d", len(invoices))
+		}
+
+		got := invoices[0]
+		if got.PaymentHash != inv.PaymentHash {
+			t.Errorf("PaymentHash = %s, want %s", got.PaymentHash, inv.PaymentHash)
+		}
+		if got.FileID != inv.FileID {
+			t.Errorf("FileID = %s, want %s", got.FileID, inv.FileID)
+		}
+		if got.PaymentRequest != inv.PaymentRequest {
+			t.Errorf("PaymentRequest = %s, want %s", got.PaymentRequest, inv.PaymentRequest)
+		}
+		if got.AmountSats != inv.AmountSats {
+			t.Errorf("AmountSats = %d, want %d", got.AmountSats, inv.AmountSats)
+		}
+	})
+
+	t.Run("Delete", func(t *testing.T) {
+		// Invoice from previous test should exist
+		if err := store.DeletePendingInvoice(ctx, "abc123hash"); err != nil {
+			t.Fatalf("failed to delete invoice: %v", err)
+		}
+
+		invoices, err := store.ListPendingInvoices(ctx)
+		if err != nil {
+			t.Fatalf("failed to list invoices: %v", err)
+		}
+
+		if len(invoices) != 0 {
+			t.Errorf("expected 0 invoices after delete, got %d", len(invoices))
+		}
+	})
+
+	t.Run("SaveOrReplace", func(t *testing.T) {
+		inv1 := &PendingInvoice{
+			PaymentHash:    "hash-replace",
+			FileID:         "file-1",
+			PaymentRequest: "lnbc1...",
+			AmountSats:     500,
+			CreatedAt:      time.Now(),
+		}
+		store.SavePendingInvoice(ctx, inv1)
+
+		// Save again with same hash but different data
+		inv2 := &PendingInvoice{
+			PaymentHash:    "hash-replace",
+			FileID:         "file-2",
+			PaymentRequest: "lnbc2...",
+			AmountSats:     1000,
+			CreatedAt:      time.Now(),
+		}
+		if err := store.SavePendingInvoice(ctx, inv2); err != nil {
+			t.Fatalf("failed to replace invoice: %v", err)
+		}
+
+		invoices, _ := store.ListPendingInvoices(ctx)
+		found := false
+		for _, inv := range invoices {
+			if inv.PaymentHash == "hash-replace" {
+				found = true
+				if inv.FileID != "file-2" {
+					t.Errorf("expected replaced FileID file-2, got %s", inv.FileID)
+				}
+			}
+		}
+		if !found {
+			t.Error("replaced invoice not found")
+		}
+	})
+}
+
 func TestSQLiteStore_GetStats(t *testing.T) {
 	store, err := NewSQLiteStore(":memory:")
 	if err != nil {

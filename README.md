@@ -71,7 +71,7 @@ Open [http://localhost:8080](http://localhost:8080) in your browser.
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `ALBY_TOKEN` | No | Alby Wallet API token for Lightning payments. Uses mock client if not set. |
-| `WEBHOOK_URL` | No | Public URL for Alby payment webhooks (default: `https://satoshisend.xyz/api/webhook/alby`) |
+| `ALBY_WEBHOOK_SECRET` | If using Alby | SVIX webhook secret from your Alby webhook endpoint (see setup below) |
 | `B2_KEY_ID` | No | Backblaze B2 key ID (enables cloud storage) |
 | `B2_APP_KEY` | No | Backblaze B2 application key |
 | `B2_BUCKET` | No | Backblaze B2 bucket name |
@@ -82,7 +82,7 @@ Open [http://localhost:8080](http://localhost:8080) in your browser.
 
 SatoshiSend uses [Alby](https://getalby.com) for Lightning Network payments.
 
-### Getting an API Token
+### 1. Get an API Token
 
 1. Log in at [getalby.com](https://getalby.com)
 2. Go to [Developer Portal → Access Tokens](https://getalby.com/developer/access_tokens/new)
@@ -90,21 +90,61 @@ SatoshiSend uses [Alby](https://getalby.com) for Lightning Network payments.
    - `invoices:create` — Create payment invoices
    - `invoices:read` — Check payment status
 4. Set an expiry date and click **Create**
+5. Save the token as `ALBY_TOKEN`
 
-### Running with Real Payments
+### 2. Register a Webhook (one-time setup)
+
+Register a webhook endpoint with Alby to receive payment notifications.
+
+**Option A: Via the Alby Dashboard**
+
+1. Go to [Developer Portal → Webhook Endpoints](https://getalby.com/developer/webhook_endpoints)
+2. Click **Add Webhook Endpoint**
+3. Set URL to `https://your-domain.com/api/webhook/alby`
+4. Select event type `invoice.incoming.settled`
+5. Copy the **Endpoint Secret** and save it as `ALBY_WEBHOOK_SECRET`
+
+**Option B: Via the API**
+
+```bash
+curl -X POST https://api.getalby.com/webhook_endpoints \
+  -H "Authorization: Bearer $ALBY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://your-domain.com/api/webhook/alby",
+    "filter_types": ["invoice.incoming.settled"],
+    "description": "SatoshiSend payments"
+  }'
+```
+
+The response contains `endpoint_secret` — save this as `ALBY_WEBHOOK_SECRET`.
+
+### 3. Run with Real Payments
 
 ```bash
 export ALBY_TOKEN="your-access-token"
-export WEBHOOK_URL="https://your-domain.com/api/webhook/alby"
+export ALBY_WEBHOOK_SECRET="whsec_..."
 go run ./cmd/server
+```
+
+### Managing Webhooks
+
+```bash
+# List all webhook endpoints
+curl -H "Authorization: Bearer $ALBY_TOKEN" \
+  https://api.getalby.com/webhook_endpoints
+
+# Delete a webhook endpoint
+curl -X DELETE -H "Authorization: Bearer $ALBY_TOKEN" \
+  https://api.getalby.com/webhook_endpoints/<endpoint-id>
 ```
 
 ### Security Notes
 
-- Never commit tokens to version control
+- Never commit tokens or secrets to version control
 - Use minimal required scopes
 - Set appropriate token expiry dates
-- Treat tokens like passwords
+- Treat tokens and webhook secrets like passwords
 
 ## Cloud Storage with Backblaze B2
 
@@ -170,6 +210,7 @@ User=satoshisend
 WorkingDirectory=/opt/satoshisend
 ExecStart=/opt/satoshisend/server
 Environment=ALBY_TOKEN=your-token
+Environment=ALBY_WEBHOOK_SECRET=whsec_your-secret
 Environment=B2_BUCKET=your-bucket
 Restart=always
 

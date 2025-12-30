@@ -36,6 +36,15 @@ type Stats struct {
 	DailyStats   []DailyStat
 }
 
+// PendingInvoice represents an invoice awaiting payment.
+type PendingInvoice struct {
+	PaymentHash    string
+	FileID         string
+	PaymentRequest string
+	AmountSats     int64
+	CreatedAt      time.Time
+}
+
 // Store defines the interface for metadata persistence.
 type Store interface {
 	SaveFileMetadata(ctx context.Context, meta *FileMeta) error
@@ -44,5 +53,11 @@ type Store interface {
 	DeleteFileMetadata(ctx context.Context, id string) error
 	ListExpiredFiles(ctx context.Context) ([]*FileMeta, error)
 	GetStats(ctx context.Context) (*Stats, error)
+
+	// Invoice persistence for restart recovery
+	SavePendingInvoice(ctx context.Context, inv *PendingInvoice) error
+	DeletePendingInvoice(ctx context.Context, paymentHash string) error
+	ListPendingInvoices(ctx context.Context) ([]*PendingInvoice, error)
+
 	Close() error
 }
