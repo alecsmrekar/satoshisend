@@ -22,9 +22,6 @@
 body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Inter', sans-serif;
     background: var(--bg-primary);
-    background-image:
-        radial-gradient(ellipse at top, rgba(247, 147, 26, 0.03) 0%, transparent 50%),
-        radial-gradient(ellipse at bottom right, rgba(34, 197, 94, 0.02) 0%, transparent 50%);
     color: var(--text-secondary);
     margin: 0;
     padding: 40px 20px;
@@ -47,49 +44,23 @@ header {
 
 .logo-container {
     display: flex;
+    flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 20px;
+    gap: 12px;
     margin-bottom: 28px;
     text-decoration: none;
     color: inherit;
 }
 
-.logo-icon svg {
-    width: 72px;
-    height: 72px;
-    filter: drop-shadow(0 4px 24px var(--accent-orange-glow));
-    animation: float 3s ease-in-out infinite;
-}
-
-@keyframes float {
-    0%, 100% { transform: translateY(0); }
-    50% { transform: translateY(-4px); }
-}
-
-.logo-text {
-    text-align: left;
-}
-
-h1 {
-    font-size: 2.75rem;
-    font-weight: 800;
-    letter-spacing: -0.03em;
-    margin: 0;
-    color: var(--text-primary);
-    line-height: 1;
-}
-
-h1 span {
-    background: linear-gradient(135deg, var(--accent-orange) 0%, #fbbf24 100%);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
+.logo-img {
+    height: 48px;
+    width: auto;
 }
 
 .tagline {
     color: var(--text-muted);
-    margin: 6px 0 0 0;
+    margin: 0;
     font-size: 0.95rem;
     font-weight: 400;
 }
@@ -724,22 +695,8 @@ button.secondary:hover:not(:disabled) {
         padding: 20px 16px;
     }
 
-    .logo-container {
-        flex-direction: column;
-        gap: 16px;
-    }
-
-    .logo-text {
-        text-align: center;
-    }
-
-    .logo-icon svg {
-        width: 64px;
-        height: 64px;
-    }
-
-    h1 {
-        font-size: 2.25rem;
+    .logo-img {
+        height: 40px;
     }
 
     .features {
