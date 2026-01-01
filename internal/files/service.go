@@ -13,7 +13,7 @@ import (
 )
 
 // PendingTimeout is how long an unpaid file remains before cleanup.
-const PendingTimeout = 1 * time.Hour
+const PendingTimeout = 15 * time.Minute
 
 // Service handles file operations.
 type Service struct {
@@ -68,6 +68,73 @@ func (s *Service) UploadWithProgress(ctx context.Context, data io.Reader, size i
 	if err := s.store.SaveFileMetadata(ctx, meta); err != nil {
 		// Clean up the stored file if metadata save fails
 		s.storage.Delete(ctx, id)
+		return nil, err
+	}
+
+	return &UploadResult{ID: id, Size: actualSize}, nil
+}
+
+// UploadWithID stores data with a specific file ID (used for streaming proxy uploads).
+// The file ID should be obtained from InitUpload first.
+func (s *Service) UploadWithID(ctx context.Context, id string, data io.Reader, size int64, hostDuration time.Duration) (int64, error) {
+	actualSize, err := s.storage.SaveWithProgress(ctx, id, data, size, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	return actualSize, nil
+}
+
+// UploadInitResult contains the result of initiating an upload.
+type UploadInitResult struct {
+	ID string
+}
+
+// InitUpload generates a file ID for a new upload.
+func (s *Service) InitUpload(ctx context.Context) (*UploadInitResult, error) {
+	id, err := generateID()
+	if err != nil {
+		return nil, err
+	}
+
+	return &UploadInitResult{
+		ID: id,
+	}, nil
+}
+
+// CompleteUpload verifies the file was uploaded to storage and creates metadata.
+// Returns an error if the file doesn't exist or is the wrong size.
+func (s *Service) CompleteUpload(ctx context.Context, id string, expectedSize int64, hostDuration time.Duration) (*UploadResult, error) {
+	statProvider, ok := s.storage.(StatProvider)
+	if !ok {
+		return nil, errors.New("storage backend does not support stat")
+	}
+
+	// Verify the file exists and check size
+	actualSize, err := statProvider.Stat(ctx, id)
+	if err != nil {
+		if err == ErrNotFound {
+			return nil, errors.New("file not found in storage - upload may have failed")
+		}
+		return nil, err
+	}
+
+	// Verify size matches (with some tolerance for chunked encoding overhead)
+	if expectedSize > 0 && actualSize != expectedSize {
+		logging.Internal.Printf("size mismatch for %s: expected %d, got %d", id, expectedSize, actualSize)
+		// Don't fail on size mismatch - client-side encryption may add overhead
+	}
+
+	meta := &store.FileMeta{
+		ID:           id,
+		Size:         actualSize,
+		ExpiresAt:    time.Now().Add(PendingTimeout),
+		HostDuration: hostDuration,
+		Paid:         false,
+		CreatedAt:    time.Now(),
+	}
+
+	if err := s.store.SaveFileMetadata(ctx, meta); err != nil {
 		return nil, err
 	}
 

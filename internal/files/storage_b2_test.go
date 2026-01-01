@@ -42,6 +42,7 @@ type mockB2Client struct {
 	putFunc    func(ctx context.Context, bucket, key string, reader io.Reader, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error)
 	getFunc    func(ctx context.Context, bucket, key string, opts minio.GetObjectOptions) (B2Object, error)
 	removeFunc func(ctx context.Context, bucket, key string, opts minio.RemoveObjectOptions) error
+	statFunc   func(ctx context.Context, bucket, key string, opts minio.StatObjectOptions) (minio.ObjectInfo, error)
 
 	// Track calls for verification
 	putCalls    []putCall
@@ -89,6 +90,13 @@ func (m *mockB2Client) RemoveObject(ctx context.Context, bucket, key string, opt
 		return m.removeFunc(ctx, bucket, key, opts)
 	}
 	return nil
+}
+
+func (m *mockB2Client) StatObject(ctx context.Context, bucket, key string, opts minio.StatObjectOptions) (minio.ObjectInfo, error) {
+	if m.statFunc != nil {
+		return m.statFunc(ctx, bucket, key, opts)
+	}
+	return minio.ObjectInfo{}, errors.New("not implemented")
 }
 
 func TestB2Storage_Key(t *testing.T) {

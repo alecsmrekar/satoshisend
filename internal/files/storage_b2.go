@@ -25,6 +25,7 @@ type B2Client interface {
 	PutObject(ctx context.Context, bucketName, objectName string, reader io.Reader, objectSize int64, opts minio.PutObjectOptions) (minio.UploadInfo, error)
 	GetObject(ctx context.Context, bucketName, objectName string, opts minio.GetObjectOptions) (B2Object, error)
 	RemoveObject(ctx context.Context, bucketName, objectName string, opts minio.RemoveObjectOptions) error
+	StatObject(ctx context.Context, bucketName, objectName string, opts minio.StatObjectOptions) (minio.ObjectInfo, error)
 }
 
 // minioClientWrapper wraps *minio.Client to implement B2Client.
@@ -42,6 +43,10 @@ func (w *minioClientWrapper) GetObject(ctx context.Context, bucketName, objectNa
 
 func (w *minioClientWrapper) RemoveObject(ctx context.Context, bucketName, objectName string, opts minio.RemoveObjectOptions) error {
 	return w.client.RemoveObject(ctx, bucketName, objectName, opts)
+}
+
+func (w *minioClientWrapper) StatObject(ctx context.Context, bucketName, objectName string, opts minio.StatObjectOptions) (minio.ObjectInfo, error) {
+	return w.client.StatObject(ctx, bucketName, objectName, opts)
 }
 
 // B2Storage implements Storage using Backblaze B2 via S3-compatible API.
@@ -210,4 +215,24 @@ func (s *B2Storage) GetPublicURL(id string) string {
 		return s.publicURL + key
 	}
 	return s.publicURL + "/" + key
+}
+
+// Stat returns the size of a file in B2.
+func (s *B2Storage) Stat(ctx context.Context, id string) (int64, error) {
+	key := s.key(id)
+	logging.B2.Printf("stat file %s in bucket %s", key, s.bucket)
+
+	info, err := s.client.StatObject(ctx, s.bucket, key, minio.StatObjectOptions{})
+	if err != nil {
+		errResp := minio.ToErrorResponse(err)
+		if errResp.Code == "NoSuchKey" {
+			logging.B2.Printf("file %s not found", key)
+			return 0, ErrNotFound
+		}
+		logging.B2.Printf("failed to stat %s: %v", key, err)
+		return 0, err
+	}
+
+	logging.B2.Printf("stat %s: %d bytes", key, info.Size)
+	return info.Size, nil
 }

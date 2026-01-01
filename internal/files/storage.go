@@ -23,3 +23,10 @@ type PublicURLProvider interface {
 	// GetPublicURL returns the public URL for a file, or empty string if not available.
 	GetPublicURL(id string) string
 }
+
+// StatProvider is an optional interface for storage backends that support
+// checking if a file exists and getting its size.
+type StatProvider interface {
+	// Stat returns the size of a file, or ErrNotFound if it doesn't exist.
+	Stat(ctx context.Context, id string) (size int64, err error)
+}

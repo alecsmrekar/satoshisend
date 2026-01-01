@@ -1,11 +1,18 @@
 import { generateKey, exportKey, encryptFile } from './crypto/index.js';
 import { MAX_FILE_SIZE } from './crypto/constants.js';
 
+function formatSize(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
+
 /**
  * Upload a file with two-phase progress reporting.
  * @param {File} file - The file to upload
  * @param {Function} onProgress - Callback with (phase, progress, message) where:
- *   - phase: 0 = encrypting, 1 = uploading to server, 2 = uploading to secure storage
+ *   - phase: 0 = encrypting, 1 = uploading to storage
  *   - progress: 0.0 to 1.0
  *   - message: Human-readable status
  */
@@ -15,6 +22,7 @@ export async function uploadFile(file, onProgress) {
         throw new Error('File too large. Maximum size is 5GB.');
     }
 
+    const totalSize = file.size;
     onProgress(0, 0, 'Generating encryption key...');
 
     // Generate a random encryption key
@@ -25,13 +33,14 @@ export async function uploadFile(file, onProgress) {
 
     // Encrypt the file with progress reporting
     const encryptedBlob = await encryptFile(file, key, (progress) => {
-        onProgress(0, 0.1 + progress * 0.9, `Encrypting file... ${Math.round(progress * 100)}%`);
+        const processed = Math.round(totalSize * progress);
+        onProgress(0, 0.1 + progress * 0.9, `Encrypting... ${Math.round(progress * 100)}% (${formatSize(processed)} / ${formatSize(totalSize)})`);
     });
 
-    onProgress(1, 0, 'Uploading to server...');
+    onProgress(1, 0, 'Uploading...');
 
-    // Upload to server with progress tracking
-    const result = await uploadWithProgress(encryptedBlob, onProgress);
+    // Upload directly to storage with progress tracking
+    const result = await uploadDirectToStorage(encryptedBlob, onProgress);
 
     return {
         fileId: result.file_id,
@@ -43,48 +52,45 @@ export async function uploadFile(file, onProgress) {
 }
 
 /**
- * Upload blob to server with two-phase progress tracking.
- * Phase 1: Upload to app server (tracked via XHR upload events)
- * Phase 2: Upload to secure storage (tracked via polling)
+ * Upload blob via streaming proxy.
+ * 1. Call /api/upload/init to get file ID
+ * 2. PUT to /api/upload/{id} (streams through server to storage)
+ * 3. Call /api/upload/complete to finalize
  */
-async function uploadWithProgress(blob, onProgress) {
-    const formData = new FormData();
-    formData.append('file', blob, 'encrypted');
+async function uploadDirectToStorage(blob, onProgress) {
+    // Step 1: Get file ID from server
+    onProgress(1, 0, 'Preparing upload...');
 
-    // Phase 1: Upload to server using XHR (for upload progress tracking)
-    const uploadResponse = await new Promise((resolve, reject) => {
+    const initResponse = await fetch('/api/upload/init', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ size: blob.size })
+    });
+
+    if (!initResponse.ok) {
+        const errorText = await initResponse.text();
+        throw new Error(errorText || 'Failed to initialize upload');
+    }
+
+    const { file_id } = await initResponse.json();
+
+    // Step 2: Stream upload through server proxy
+    await new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
-        xhr.open('POST', '/api/upload');
+        xhr.open('PUT', `/api/upload/${file_id}`);
 
-        let switchedToPhase2 = false;
         xhr.upload.onprogress = (e) => {
             if (e.lengthComputable) {
                 const progress = e.loaded / e.total;
-                if (progress >= 1 && !switchedToPhase2) {
-                    switchedToPhase2 = true;
-                    onProgress(2, 0, 'Uploading to secure storage...');
-                } else if (!switchedToPhase2) {
-                    onProgress(1, progress, `Uploading to server... ${Math.round(progress * 100)}%`);
-                }
-            }
-        };
-
-        xhr.upload.onload = () => {
-            if (!switchedToPhase2) {
-                switchedToPhase2 = true;
-                onProgress(2, 0, 'Uploading to secure storage...');
+                onProgress(1, progress * 0.95, `Uploading... ${Math.round(progress * 100)}% (${formatSize(e.loaded)} / ${formatSize(e.total)})`);
             }
         };
 
         xhr.onload = () => {
             if (xhr.status >= 200 && xhr.status < 300) {
-                try {
-                    resolve(JSON.parse(xhr.responseText));
-                } catch (e) {
-                    reject(new Error('Invalid response from server'));
-                }
+                resolve();
             } else {
-                reject(new Error(`Upload failed: ${xhr.statusText}`));
+                reject(new Error(`Upload failed: ${xhr.status} ${xhr.statusText}`));
             }
         };
 
@@ -92,54 +98,29 @@ async function uploadWithProgress(blob, onProgress) {
             reject(new Error('Network error during upload'));
         };
 
-        xhr.send(formData);
+        xhr.send(blob);
     });
 
-    // Phase 2: Poll for B2 upload progress
-    const uploadId = uploadResponse.upload_id;
-    const result = await pollUploadProgress(uploadId, onProgress);
-    return result;
-}
+    // Step 3: Complete the upload on server
+    onProgress(1, 0.98, 'Finalizing...');
 
-/**
- * Poll for upload progress until complete or error.
- */
-async function pollUploadProgress(uploadId, onProgress) {
-    const POLL_INTERVAL = 1000; // Poll every second
-    const MAX_DURATION = 10 * 60 * 1000; // 10 minute timeout
-    const startTime = Date.now();
+    const completeResponse = await fetch('/api/upload/complete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file_id, size: blob.size })
+    });
 
-    while (true) {
-        if (Date.now() - startTime > MAX_DURATION) {
-            throw new Error('Upload timed out');
-        }
-
-        const response = await fetch(`/api/upload/${uploadId}/progress`);
-        if (!response.ok) {
-            throw new Error('Failed to check upload progress');
-        }
-
-        const status = await response.json();
-
-        if (status.status === 'error') {
-            throw new Error(status.error || 'Upload failed');
-        }
-
-        if (status.status === 'complete') {
-            onProgress(2, 1, 'Upload complete');
-            return status.result;
-        }
-
-        // Update progress
-        onProgress(2, status.progress, `Uploading to secure storage... ${Math.round(status.progress * 100)}%`);
-
-        // Wait before next poll
-        await new Promise(r => setTimeout(r, POLL_INTERVAL));
+    if (!completeResponse.ok) {
+        const errorText = await completeResponse.text();
+        throw new Error(errorText || 'Failed to complete upload');
     }
+
+    onProgress(1, 1, 'Upload complete');
+    return await completeResponse.json();
 }
 
 const POLL_INTERVAL_MS = 2000;
-const MAX_POLL_DURATION_MS = 30 * 60 * 1000; // 30 minutes
+const MAX_POLL_DURATION_MS = 15 * 60 * 1000; // 15 minutes (matches server pending timeout)
 
 export function pollPaymentStatus(fileId, onPaid, onTimeout) {
     const startTime = Date.now();

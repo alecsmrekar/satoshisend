@@ -93,11 +93,6 @@ func main() {
 		return
 	}
 
-	// Clean up any orphaned temp files from previous runs
-	if cleanedUp := api.CleanupOrphanedTempFiles(); cleanedUp > 0 {
-		logging.Internal.Printf("cleaned up %d orphaned temp files from previous run", cleanedUp)
-	}
-
 	// Initialize file storage - use B2 if configured, otherwise local filesystem
 	var storage files.Storage
 	b2Bucket := os.Getenv("B2_BUCKET")
@@ -176,7 +171,7 @@ func main() {
 
 	// Start cleanup goroutine for expired files
 	go func() {
-		ticker := time.NewTicker(1 * time.Hour)
+		ticker := time.NewTicker(15 * time.Minute)
 		defer ticker.Stop()
 		for {
 			select {

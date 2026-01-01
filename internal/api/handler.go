@@ -1,17 +1,11 @@
 package api
 
 import (
-	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"path/filepath"
 	"regexp"
-	"sync"
 	"time"
 
 	"satoshisend/internal/files"
@@ -20,38 +14,7 @@ import (
 	"satoshisend/internal/store"
 )
 
-// TempDir is the directory for temporary upload files.
-// Can be overridden for testing.
-var TempDir = os.TempDir()
-
-const (
-	// TempFilePrefix is the prefix for temporary upload files.
-	TempFilePrefix = "satoshisend-upload-"
-
-	// MaxB2Retries is the maximum number of retry attempts for B2 uploads.
-	MaxB2Retries = 3
-
-	// InitialRetryDelay is the initial delay before first retry.
-	InitialRetryDelay = 1 * time.Second
-)
-
 var validFileIDPattern = regexp.MustCompile(`^[a-zA-Z0-9]+$`)
-
-// backgroundUpload tracks the state of a background B2 upload.
-type backgroundUpload struct {
-	mu           sync.RWMutex
-	status       string          // "uploading", "complete", "error"
-	progress     float64         // 0.0 to 1.0
-	error        string          // error message if status == "error"
-	result       *UploadResponse // final result if status == "complete"
-	tempFilePath string          // path to temporary file containing upload data
-	size         int64           // file size
-	createdAt    time.Time       // when the upload started
-	uploaderIP   string          // IP address of uploader (for rate limiting)
-}
-
-// backgroundUploads stores all in-progress background uploads.
-var backgroundUploads = sync.Map{}
 
 // WebhookHandler is an interface for handling webhook callbacks.
 type WebhookHandler interface {
@@ -86,8 +49,9 @@ func (h *Handler) SetWebhookHandler(wh WebhookHandler) {
 }
 
 func (h *Handler) registerRoutes() {
-	h.mux.HandleFunc("POST /api/upload", h.handleUpload)
-	h.mux.HandleFunc("GET /api/upload/{id}/progress", h.handleUploadProgress)
+	h.mux.HandleFunc("POST /api/upload/init", h.handleUploadInit)
+	h.mux.HandleFunc("POST /api/upload/complete", h.handleUploadComplete)
+	h.mux.HandleFunc("PUT /api/upload/{id}", h.handleUploadStream)
 	h.mux.HandleFunc("GET /api/file/{id}", h.handleDownload)
 	h.mux.HandleFunc("HEAD /api/file/{id}", h.handleDownload)
 	h.mux.HandleFunc("GET /api/file/{id}/status", h.handleStatus)
@@ -103,8 +67,24 @@ func isValidFileID(id string) bool {
 	return id != "" && len(id) <= 64 && validFileIDPattern.MatchString(id)
 }
 
-// UploadResponse is the final response for completed file upload.
-type UploadResponse struct {
+// UploadInitRequest is the request body for initiating a direct upload.
+type UploadInitRequest struct {
+	Size int64 `json:"size"`
+}
+
+// UploadInitResponse is returned when initiating an upload.
+type UploadInitResponse struct {
+	FileID string `json:"file_id"`
+}
+
+// UploadCompleteRequest is the request body for completing an upload.
+type UploadCompleteRequest struct {
+	FileID string `json:"file_id"`
+	Size   int64  `json:"size"`
+}
+
+// UploadCompleteResponse is the response after completing an upload.
+type UploadCompleteResponse struct {
 	FileID         string `json:"file_id"`
 	Size           int64  `json:"size"`
 	PaymentRequest string `json:"payment_request"`
@@ -112,24 +92,10 @@ type UploadResponse struct {
 	AmountSats     int64  `json:"amount_sats"`
 }
 
-// UploadStartResponse is returned immediately when upload to server completes.
-type UploadStartResponse struct {
-	UploadID string `json:"upload_id"`
-	Size     int64  `json:"size"`
-}
-
-// UploadProgressResponse is returned when polling for upload progress.
-type UploadProgressResponse struct {
-	Status   string          `json:"status"`             // "uploading", "complete", "error"
-	Progress float64         `json:"progress"`           // 0.0 to 1.0
-	Error    string          `json:"error,omitempty"`    // error message if status == "error"
-	Result   *UploadResponse `json:"result,omitempty"`   // final result if status == "complete"
-}
-
 // MaxUploadSize is the maximum allowed file size (5GB).
 const MaxUploadSize = 5 << 30
 
-func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleUploadInit(w http.ResponseWriter, r *http.Request) {
 	// Extract client IP for rate limiting
 	ip := extractIP(r)
 
@@ -143,149 +109,68 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Limit upload size to 5GB
-	r.Body = http.MaxBytesReader(w, r.Body, MaxUploadSize)
+	var req UploadInitRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
 
-	// Parse multipart form (use 32MB for memory, rest goes to disk)
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	// Validate size
+	if req.Size <= 0 {
+		http.Error(w, "size must be positive", http.StatusBadRequest)
+		return
+	}
+	if req.Size > MaxUploadSize {
 		http.Error(w, "file too large (max 5GB)", http.StatusRequestEntityTooLarge)
 		return
 	}
 
-	file, _, err := r.FormFile("file")
+	// Get presigned URL from file service
+	result, err := h.files.InitUpload(r.Context())
 	if err != nil {
-		http.Error(w, "missing file", http.StatusBadRequest)
+		logging.Internal.Printf("failed to init upload: %v", err)
+		http.Error(w, "failed to initialize upload", http.StatusInternalServerError)
 		return
 	}
-	defer file.Close()
 
-	// Generate upload ID first (used for temp file name)
-	uploadIDBytes := make([]byte, 16)
-	if _, err := rand.Read(uploadIDBytes); err != nil {
-		http.Error(w, "failed to generate upload ID", http.StatusInternalServerError)
-		return
-	}
-	uploadID := hex.EncodeToString(uploadIDBytes)
+	logging.Internal.Printf("upload init: file_id=%s, size=%d", result.ID, req.Size)
 
-	// Create temp file for streaming upload to disk (not memory!)
-	tempFile, err := os.CreateTemp(TempDir, TempFilePrefix+uploadID+"-")
-	if err != nil {
-		logging.Internal.Printf("failed to create temp file: %v", err)
-		http.Error(w, "failed to process upload", http.StatusInternalServerError)
-		return
-	}
-	tempFilePath := tempFile.Name()
-
-	// Stream file to disk
-	fileSize, err := io.Copy(tempFile, file)
-	if err != nil {
-		tempFile.Close()
-		os.Remove(tempFilePath)
-		http.Error(w, "failed to read file", http.StatusInternalServerError)
-		return
-	}
-	tempFile.Close()
-
-	logging.Internal.Printf("upload: received %d bytes -> temp file %s", fileSize, filepath.Base(tempFilePath))
-
-	// Create background upload tracker
-	upload := &backgroundUpload{
-		status:       "uploading",
-		progress:     0,
-		tempFilePath: tempFilePath,
-		size:         fileSize,
-		createdAt:    time.Now(),
-		uploaderIP:   ip,
-	}
-	backgroundUploads.Store(uploadID, upload)
-
-	// Start background goroutine to upload to B2
-	go h.processBackgroundUpload(uploadID, upload)
-
-	// Return immediately with upload ID
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(UploadStartResponse{
-		UploadID: uploadID,
-		Size:     fileSize,
+	if err := json.NewEncoder(w).Encode(UploadInitResponse{
+		FileID: result.ID,
 	}); err != nil {
 		logging.Internal.Printf("failed to encode response: %v", err)
 	}
 }
 
-// processBackgroundUpload handles the B2 upload in the background.
-func (h *Handler) processBackgroundUpload(uploadID string, upload *backgroundUpload) {
-	ctx := context.Background()
+func (h *Handler) handleUploadComplete(w http.ResponseWriter, r *http.Request) {
+	// Extract client IP for rate limiting
+	ip := extractIP(r)
 
-	// Helper to clean up temp file and mark as error
-	markError := func(errMsg string) {
-		upload.mu.Lock()
-		upload.status = "error"
-		upload.error = errMsg
-		tempPath := upload.tempFilePath
-		upload.tempFilePath = ""
-		upload.mu.Unlock()
-
-		if tempPath != "" {
-			os.Remove(tempPath)
-		}
-	}
-
-	// Track progress
-	onProgress := func(written, total int64) {
-		if total > 0 {
-			upload.mu.Lock()
-			upload.progress = float64(written) / float64(total)
-			upload.mu.Unlock()
-		}
-	}
-
-	// Upload to B2 with retry logic
-	var result *files.UploadResult
-	var lastErr error
-	delay := InitialRetryDelay
-
-	for attempt := 1; attempt <= MaxB2Retries; attempt++ {
-		// Open temp file for reading
-		tempFile, err := os.Open(upload.tempFilePath)
-		if err != nil {
-			logging.Internal.Printf("failed to open temp file: %v", err)
-			markError("failed to read upload data")
-			return
-		}
-
-		result, lastErr = h.files.UploadWithProgress(ctx, tempFile, upload.size, 7*24*time.Hour, onProgress)
-		tempFile.Close()
-
-		if lastErr == nil {
-			break // Success!
-		}
-
-		logging.Internal.Printf("B2 upload attempt %d/%d failed: %v", attempt, MaxB2Retries, lastErr)
-
-		if attempt < MaxB2Retries {
-			// Reset progress for retry
-			upload.mu.Lock()
-			upload.progress = 0
-			upload.mu.Unlock()
-
-			time.Sleep(delay)
-			delay *= 2 // Exponential backoff
-		}
-	}
-
-	if lastErr != nil {
-		logging.Internal.Printf("background upload failed after %d attempts: %v", MaxB2Retries, lastErr)
-		markError("upload failed")
+	var req UploadCompleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 
-	// Clean up temp file after successful upload
-	upload.mu.Lock()
-	tempPath := upload.tempFilePath
-	upload.tempFilePath = ""
-	upload.mu.Unlock()
-	if tempPath != "" {
-		os.Remove(tempPath)
+	// Validate file ID
+	if !isValidFileID(req.FileID) {
+		http.Error(w, "invalid file ID", http.StatusBadRequest)
+		return
+	}
+
+	// Validate size
+	if req.Size <= 0 {
+		http.Error(w, "size must be positive", http.StatusBadRequest)
+		return
+	}
+
+	// Verify upload and create metadata
+	result, err := h.files.CompleteUpload(r.Context(), req.FileID, req.Size, 7*24*time.Hour)
+	if err != nil {
+		logging.Internal.Printf("failed to complete upload: %v", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	// Calculate price: 1 sat per MB, minimum 100 sats
@@ -295,71 +180,66 @@ func (h *Handler) processBackgroundUpload(uploadID string, upload *backgroundUpl
 	}
 
 	// Create payment invoice
-	invoice, err := h.payments.CreateInvoiceForFile(ctx, result.ID, amountSats)
+	invoice, err := h.payments.CreateInvoiceForFile(r.Context(), result.ID, amountSats)
 	if err != nil {
 		logging.Internal.Printf("failed to create invoice: %v", err)
-		upload.mu.Lock()
-		upload.status = "error"
-		upload.error = "failed to create invoice"
-		upload.mu.Unlock()
+		http.Error(w, "failed to create invoice", http.StatusInternalServerError)
 		return
 	}
 
-	// Track pending file for rate limiting (using IP stored in upload)
-	if h.pendingLimiter != nil && upload.uploaderIP != "" {
-		h.pendingLimiter.TrackPendingFile(upload.uploaderIP, result.ID)
+	// Track pending file for rate limiting
+	if h.pendingLimiter != nil && ip != "" {
+		h.pendingLimiter.TrackPendingFile(ip, result.ID)
 	}
 
-	// Mark as complete
-	upload.mu.Lock()
-	upload.status = "complete"
-	upload.progress = 1.0
-	upload.result = &UploadResponse{
+	logging.Internal.Printf("upload complete: file_id=%s, size=%d, amount=%d sats", result.ID, result.Size, amountSats)
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(UploadCompleteResponse{
 		FileID:         result.ID,
 		Size:           result.Size,
 		PaymentRequest: invoice.PaymentRequest,
 		PaymentHash:    invoice.PaymentHash,
 		AmountSats:     invoice.AmountSats,
-	}
-	upload.mu.Unlock()
-
-	logging.Internal.Printf("background upload complete: %s -> %s", uploadID, result.ID)
-
-	// Schedule cleanup after 5 minutes
-	go func() {
-		time.Sleep(5 * time.Minute)
-		backgroundUploads.Delete(uploadID)
-	}()
-}
-
-// handleUploadProgress returns the progress of a background upload.
-func (h *Handler) handleUploadProgress(w http.ResponseWriter, r *http.Request) {
-	uploadID := r.PathValue("id")
-	if uploadID == "" {
-		http.Error(w, "missing upload ID", http.StatusBadRequest)
-		return
-	}
-
-	val, ok := backgroundUploads.Load(uploadID)
-	if !ok {
-		http.Error(w, "upload not found", http.StatusNotFound)
-		return
-	}
-
-	upload := val.(*backgroundUpload)
-	upload.mu.RLock()
-	resp := UploadProgressResponse{
-		Status:   upload.status,
-		Progress: upload.progress,
-		Error:    upload.error,
-		Result:   upload.result,
-	}
-	upload.mu.RUnlock()
-
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
+	}); err != nil {
 		logging.Internal.Printf("failed to encode response: %v", err)
 	}
+}
+
+// handleUploadStream handles streaming uploads directly to storage.
+// This is a fallback for when direct-to-storage uploads don't work (e.g., B2 CORS issues).
+// The client should call /api/upload/init first to get a file ID, then PUT the data here.
+func (h *Handler) handleUploadStream(w http.ResponseWriter, r *http.Request) {
+	fileID := r.PathValue("id")
+	if !isValidFileID(fileID) {
+		http.Error(w, "invalid file ID", http.StatusBadRequest)
+		return
+	}
+
+	// Get content length
+	contentLength := r.ContentLength
+	if contentLength <= 0 {
+		http.Error(w, "Content-Length header required", http.StatusBadRequest)
+		return
+	}
+	if contentLength > MaxUploadSize {
+		http.Error(w, "file too large (max 5GB)", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	// Limit body size
+	r.Body = http.MaxBytesReader(w, r.Body, MaxUploadSize)
+
+	// Stream directly to storage (no temp file)
+	size, err := h.files.UploadWithID(r.Context(), fileID, r.Body, contentLength, 7*24*time.Hour)
+	if err != nil {
+		logging.Internal.Printf("stream upload failed for %s: %v", fileID, err)
+		http.Error(w, "upload failed", http.StatusInternalServerError)
+		return
+	}
+
+	logging.Internal.Printf("stream upload complete: file_id=%s, size=%d", fileID, size)
+	w.WriteHeader(http.StatusOK)
 }
 
 func (h *Handler) handleDownload(w http.ResponseWriter, r *http.Request) {
@@ -502,27 +382,4 @@ func (h *Handler) handleAlbyWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
-}
-
-// CleanupOrphanedTempFiles removes any leftover temp files from previous runs.
-// This should be called at startup to clean up files from crashed/restarted processes.
-// Returns the number of files cleaned up.
-func CleanupOrphanedTempFiles() int {
-	pattern := filepath.Join(TempDir, TempFilePrefix+"*")
-	matches, err := filepath.Glob(pattern)
-	if err != nil {
-		logging.Internal.Printf("failed to glob temp files: %v", err)
-		return 0
-	}
-
-	count := 0
-	for _, path := range matches {
-		if err := os.Remove(path); err != nil {
-			logging.Internal.Printf("failed to remove orphaned temp file %s: %v", filepath.Base(path), err)
-		} else {
-			count++
-		}
-	}
-
-	return count
 }

@@ -135,6 +135,7 @@ function initUpload() {
         try {
             const result = await uploadFile(file, (phase, progress, message) => {
                 updatePhase(uploadProgress, phase, progress);
+                uploadStatus.textContent = message;
             });
 
             completeAllPhases(uploadProgress);
