@@ -26,6 +26,8 @@
 
         <!-- Twitter Card -->
         <meta name="twitter:card" content="summary_large_image" />
+        <meta name="twitter:site" content="@SatoshiSend" />
+        <meta name="twitter:creator" content="@SatoshiSend" />
         <meta name="twitter:title" content="SatoshiSend - Encrypted File Sharing with Bitcoin Lightning" />
         <meta name="twitter:description" content="Share files securely with end-to-end encryption and Bitcoin Lightning payments." />
         <meta name="twitter:image" content="https://satoshisend.xyz/img.png" />
@@ -103,6 +105,42 @@
                                 "@type": "Answer",
                                 "text": "The decryption key is stored in the URL fragment (after the #), which is never sent to the server. Only people with your exact link can decrypt the file. The server only stores encrypted data it cannot read."
                             }
+                        }
+                    ]
+                },
+                {
+                    "@type": "HowTo",
+                    "name": "How to Share Encrypted Files with Bitcoin Lightning",
+                    "description": "Share files securely using end-to-end encryption and pay with Bitcoin Lightning Network.",
+                    "totalTime": "PT2M",
+                    "tool": [
+                        {
+                            "@type": "HowToTool",
+                            "name": "Web browser with JavaScript enabled"
+                        },
+                        {
+                            "@type": "HowToTool",
+                            "name": "Bitcoin Lightning wallet"
+                        }
+                    ],
+                    "step": [
+                        {
+                            "@type": "HowToStep",
+                            "position": 1,
+                            "name": "Encrypt your file",
+                            "text": "Select a file to upload. Your file is encrypted in your browser using AES-256-GCM before it ever leaves your device. The encryption key is generated locally and never sent to the server."
+                        },
+                        {
+                            "@type": "HowToStep",
+                            "position": 2,
+                            "name": "Pay with Lightning",
+                            "text": "Pay a small fee (1 sat/MB, minimum 100 sats) via the Bitcoin Lightning Network to host your encrypted file for 7 days. Scan the QR code or copy the invoice to your Lightning wallet."
+                        },
+                        {
+                            "@type": "HowToStep",
+                            "position": 3,
+                            "name": "Share the link",
+                            "text": "After payment, you receive a unique URL. The decryption key is stored in the URL fragment (after the #), which is never sent to the server. Only people with your exact link can decrypt the file."
                         }
                     ]
                 }
