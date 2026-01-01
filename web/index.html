@@ -3,7 +3,7 @@
     <head>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>SatoshiSend - Encrypted File Sharing</title>
+        <title>SatoshiSend - Encrypted File Sharing with Bitcoin Lightning</title>
 
         <!-- SEO Meta Tags -->
         <meta name="description" content="Share files securely with end-to-end encryption and Bitcoin Lightning payments. Files are encrypted in your browser before upload - the server never sees your data." />
@@ -15,7 +15,7 @@
         <!-- Open Graph / Social -->
         <meta property="og:type" content="website" />
         <meta property="og:url" content="https://satoshisend.xyz" />
-        <meta property="og:title" content="SatoshiSend - Encrypted File Sharing" />
+        <meta property="og:title" content="SatoshiSend - Encrypted File Sharing with Bitcoin Lightning" />
         <meta property="og:description" content="Share files securely with end-to-end encryption and Bitcoin Lightning payments." />
         <meta property="og:site_name" content="SatoshiSend" />
         <meta property="og:image" content="https://satoshisend.xyz/img.png" />
@@ -26,7 +26,7 @@
 
         <!-- Twitter Card -->
         <meta name="twitter:card" content="summary_large_image" />
-        <meta name="twitter:title" content="SatoshiSend - Encrypted File Sharing" />
+        <meta name="twitter:title" content="SatoshiSend - Encrypted File Sharing with Bitcoin Lightning" />
         <meta name="twitter:description" content="Share files securely with end-to-end encryption and Bitcoin Lightning payments." />
         <meta name="twitter:image" content="https://satoshisend.xyz/img.png" />
         <meta name="twitter:image:alt" content="SatoshiSend - Zero-knowledge encrypted file sharing with Bitcoin Lightning" />
@@ -38,33 +38,80 @@
         <script type="application/ld+json">
         {
             "@context": "https://schema.org",
-            "@type": "WebApplication",
-            "name": "SatoshiSend",
-            "url": "https://satoshisend.xyz",
-            "description": "Encrypted file sharing with Bitcoin Lightning payments. Files are encrypted client-side before upload, ensuring the server never has access to unencrypted content.",
-            "applicationCategory": "FileSharing",
-            "operatingSystem": "Any",
-            "offers": {
-                "@type": "Offer",
-                "price": "0.00000100",
-                "priceCurrency": "BTC",
-                "description": "1 sat per MB, minimum 100 sats for 7 days hosting"
-            },
-            "featureList": [
-                "End-to-end encryption",
-                "Client-side encryption using AES-GCM",
-                "Bitcoin Lightning Network payments",
-                "Zero-knowledge file storage",
-                "No account required"
-            ],
-            "potentialAction": {
-                "@type": "ShareAction",
-                "target": "Upload and share encrypted files"
-            }
+            "@graph": [
+                {
+                    "@type": "Organization",
+                    "@id": "https://satoshisend.xyz/#organization",
+                    "name": "SatoshiSend",
+                    "url": "https://satoshisend.xyz",
+                    "logo": "https://satoshisend.xyz/logo-orange.png",
+                    "sameAs": [
+                        "https://github.com/alecsmrekar/satoshisend"
+                    ]
+                },
+                {
+                    "@type": "WebApplication",
+                    "name": "SatoshiSend",
+                    "url": "https://satoshisend.xyz",
+                    "description": "Encrypted file sharing with Bitcoin Lightning payments. Files are encrypted client-side before upload, ensuring the server never has access to unencrypted content.",
+                    "applicationCategory": "FileSharing",
+                    "operatingSystem": "Any",
+                    "provider": {
+                        "@id": "https://satoshisend.xyz/#organization"
+                    },
+                    "offers": {
+                        "@type": "Offer",
+                        "price": "0.00000100",
+                        "priceCurrency": "BTC",
+                        "description": "1 sat per MB, minimum 100 sats for 7 days hosting"
+                    },
+                    "featureList": [
+                        "End-to-end encryption",
+                        "Client-side encryption using AES-GCM",
+                        "Bitcoin Lightning Network payments",
+                        "Zero-knowledge file storage",
+                        "No account required"
+                    ],
+                    "potentialAction": {
+                        "@type": "ShareAction",
+                        "target": "Upload and share encrypted files"
+                    }
+                },
+                {
+                    "@type": "FAQPage",
+                    "mainEntity": [
+                        {
+                            "@type": "Question",
+                            "name": "How does SatoshiSend encrypt files?",
+                            "acceptedAnswer": {
+                                "@type": "Answer",
+                                "text": "Your file is encrypted in your browser using AES-256-GCM before it ever leaves your device. The encryption key is generated locally and never sent to our servers. This is powered by the Web Crypto API built into your browser."
+                            }
+                        },
+                        {
+                            "@type": "Question",
+                            "name": "How do I pay to host files on SatoshiSend?",
+                            "acceptedAnswer": {
+                                "@type": "Answer",
+                                "text": "Pay a small fee (1 sat/MB, minimum 100 sats) via the Bitcoin Lightning Network to host your encrypted file for 7 days. No account or email required."
+                            }
+                        },
+                        {
+                            "@type": "Question",
+                            "name": "How does SatoshiSend keep my files secure?",
+                            "acceptedAnswer": {
+                                "@type": "Answer",
+                                "text": "The decryption key is stored in the URL fragment (after the #), which is never sent to the server. Only people with your exact link can decrypt the file. The server only stores encrypted data it cannot read."
+                            }
+                        }
+                    ]
+                }
+            ]
         }
         </script>
 
         <link rel="icon" type="image/png" href="/favicon.png" />
+        <link rel="apple-touch-icon" href="/favicon.png" />
         <link rel="stylesheet" href="/css/style.css" />
         <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode/1.4.4/qrcode.min.js"></script>
         <script src="https://cdn.jsdelivr.net/npm/streamsaver@2.0.6/StreamSaver.min.js"></script>
@@ -73,6 +120,7 @@
         <div class="container">
             <header>
                 <a href="/" class="logo-container">
+                    <h1 class="sr-only">Encrypted File Sharing with Bitcoin Lightning</h1>
                     <img src="/logo-orange.png" alt="SatoshiSend" class="logo-img" />
                     <p class="tagline">Private file sharing. Pay in sats.</p>
                 </a>
