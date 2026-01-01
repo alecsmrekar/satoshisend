@@ -105,7 +105,7 @@ async function uploadWithProgress(blob, onProgress) {
  * Poll for upload progress until complete or error.
  */
 async function pollUploadProgress(uploadId, onProgress) {
-    const POLL_INTERVAL = 200; // Poll every 200ms for responsive progress
+    const POLL_INTERVAL = 1000; // Poll every second
     const MAX_DURATION = 10 * 60 * 1000; // 10 minute timeout
     const startTime = Date.now();
 

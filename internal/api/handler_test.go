@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -949,4 +953,441 @@ func TestHandler_Upload_NoPendingLimiter(t *testing.T) {
 			t.Errorf("upload %d should succeed without limiter, got %d", i+1, code)
 		}
 	}
+}
+
+// --- Temp file handling tests ---
+
+func TestHandler_Upload_TempFileCleanup(t *testing.T) {
+	// Create a dedicated temp directory for this test
+	testTempDir, err := os.MkdirTemp("", "satoshisend-test-*")
+	if err != nil {
+		t.Fatalf("failed to create test temp dir: %v", err)
+	}
+	defer os.RemoveAll(testTempDir)
+
+	// Override the global TempDir for this test
+	originalTempDir := TempDir
+	TempDir = testTempDir
+	defer func() { TempDir = originalTempDir }()
+
+	handler, _ := setupTestHandler()
+
+	// Upload a file
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, _ := writer.CreateFormFile("file", "test.txt")
+	part.Write([]byte("test content for temp file cleanup"))
+	writer.Close()
+
+	req := httptest.NewRequest("POST", "/api/upload", &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload failed: %d - %s", rec.Code, rec.Body.String())
+	}
+
+	var startResp UploadStartResponse
+	if err := json.NewDecoder(rec.Body).Decode(&startResp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	// Poll until complete
+	for i := 0; i < 50; i++ {
+		req := httptest.NewRequest("GET", "/api/upload/"+startResp.UploadID+"/progress", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		var progress UploadProgressResponse
+		json.NewDecoder(rec.Body).Decode(&progress)
+
+		if progress.Status == "complete" {
+			break
+		}
+		if progress.Status == "error" {
+			t.Fatalf("upload failed: %s", progress.Error)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Give a moment for cleanup
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify temp file was cleaned up
+	files, _ := filepath.Glob(filepath.Join(testTempDir, TempFilePrefix+"*"))
+	if len(files) > 0 {
+		t.Errorf("temp files should be cleaned up after successful upload, found: %v", files)
+	}
+}
+
+func TestHandler_Upload_TempFileCleanupOnError(t *testing.T) {
+	// Create a dedicated temp directory for this test
+	testTempDir, err := os.MkdirTemp("", "satoshisend-test-*")
+	if err != nil {
+		t.Fatalf("failed to create test temp dir: %v", err)
+	}
+	defer os.RemoveAll(testTempDir)
+
+	// Override the global TempDir for this test
+	originalTempDir := TempDir
+	TempDir = testTempDir
+	defer func() { TempDir = originalTempDir }()
+
+	// Use a failing storage
+	storage := &failingMockStorage{failAfter: 0}
+	st := newMockStore()
+	lnd := payments.NewMockLNDClient()
+
+	filesSvc := files.NewService(storage, st)
+	paymentsSvc := payments.NewService(lnd, st)
+
+	handler := NewHandler(filesSvc, paymentsSvc, nil)
+
+	// Upload a file
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, _ := writer.CreateFormFile("file", "test.txt")
+	part.Write([]byte("test content for error cleanup"))
+	writer.Close()
+
+	req := httptest.NewRequest("POST", "/api/upload", &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload start failed: %d", rec.Code)
+	}
+
+	var startResp UploadStartResponse
+	json.NewDecoder(rec.Body).Decode(&startResp)
+
+	// Poll until error (with all retries exhausted)
+	for i := 0; i < 100; i++ {
+		req := httptest.NewRequest("GET", "/api/upload/"+startResp.UploadID+"/progress", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		var progress UploadProgressResponse
+		json.NewDecoder(rec.Body).Decode(&progress)
+
+		if progress.Status == "error" {
+			break
+		}
+		if progress.Status == "complete" {
+			t.Fatal("upload should have failed")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Give a moment for cleanup
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify temp file was cleaned up
+	files, _ := filepath.Glob(filepath.Join(testTempDir, TempFilePrefix+"*"))
+	if len(files) > 0 {
+		t.Errorf("temp files should be cleaned up after failed upload, found: %v", files)
+	}
+}
+
+// failingMockStorage fails after a certain number of calls
+type failingMockStorage struct {
+	callCount int
+	failAfter int // fail on all calls if 0
+}
+
+func (m *failingMockStorage) Save(ctx context.Context, id string, data io.Reader) (int64, error) {
+	return m.SaveWithProgress(ctx, id, data, -1, nil)
+}
+
+func (m *failingMockStorage) SaveWithProgress(ctx context.Context, id string, data io.Reader, size int64, onProgress files.ProgressFunc) (int64, error) {
+	m.callCount++
+	if m.failAfter == 0 || m.callCount <= m.failAfter {
+		return 0, errors.New("simulated storage failure")
+	}
+	// Drain the reader
+	n, _ := io.Copy(io.Discard, data)
+	return n, nil
+}
+
+func (m *failingMockStorage) Load(ctx context.Context, id string) (io.ReadCloser, error) {
+	return nil, files.ErrNotFound
+}
+
+func (m *failingMockStorage) Delete(ctx context.Context, id string) error {
+	return nil
+}
+
+func TestHandler_Upload_RetryLogic(t *testing.T) {
+	// Create a dedicated temp directory for this test
+	testTempDir, err := os.MkdirTemp("", "satoshisend-test-*")
+	if err != nil {
+		t.Fatalf("failed to create test temp dir: %v", err)
+	}
+	defer os.RemoveAll(testTempDir)
+
+	// Override the global TempDir for this test
+	originalTempDir := TempDir
+	TempDir = testTempDir
+	defer func() { TempDir = originalTempDir }()
+
+	// Storage that fails first 2 attempts, succeeds on 3rd
+	storage := &retryMockStorage{
+		failCount:    2,
+		successFiles: make(map[string][]byte),
+	}
+	st := newMockStore()
+	lnd := payments.NewMockLNDClient()
+
+	filesSvc := files.NewService(storage, st)
+	paymentsSvc := payments.NewService(lnd, st)
+
+	handler := NewHandler(filesSvc, paymentsSvc, nil)
+
+	// Upload a file
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, _ := writer.CreateFormFile("file", "test.txt")
+	part.Write([]byte("test content for retry"))
+	writer.Close()
+
+	req := httptest.NewRequest("POST", "/api/upload", &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload start failed: %d", rec.Code)
+	}
+
+	var startResp UploadStartResponse
+	json.NewDecoder(rec.Body).Decode(&startResp)
+
+	// Poll until complete
+	var finalStatus string
+	for i := 0; i < 100; i++ {
+		req := httptest.NewRequest("GET", "/api/upload/"+startResp.UploadID+"/progress", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		var progress UploadProgressResponse
+		json.NewDecoder(rec.Body).Decode(&progress)
+
+		finalStatus = progress.Status
+		if progress.Status == "complete" || progress.Status == "error" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if finalStatus != "complete" {
+		t.Errorf("upload should have succeeded after retries, got status: %s", finalStatus)
+	}
+
+	// Verify storage was called 3 times (2 failures + 1 success)
+	if storage.callCount != 3 {
+		t.Errorf("expected 3 storage calls (2 failures + 1 success), got %d", storage.callCount)
+	}
+}
+
+// retryMockStorage fails first N attempts, then succeeds
+type retryMockStorage struct {
+	callCount    int
+	failCount    int
+	successFiles map[string][]byte
+}
+
+func (m *retryMockStorage) Save(ctx context.Context, id string, data io.Reader) (int64, error) {
+	return m.SaveWithProgress(ctx, id, data, -1, nil)
+}
+
+func (m *retryMockStorage) SaveWithProgress(ctx context.Context, id string, data io.Reader, size int64, onProgress files.ProgressFunc) (int64, error) {
+	m.callCount++
+	if m.callCount <= m.failCount {
+		return 0, errors.New("simulated temporary failure")
+	}
+	buf, _ := io.ReadAll(data)
+	m.successFiles[id] = buf
+	if onProgress != nil {
+		onProgress(int64(len(buf)), int64(len(buf)))
+	}
+	return int64(len(buf)), nil
+}
+
+func (m *retryMockStorage) Load(ctx context.Context, id string) (io.ReadCloser, error) {
+	data, ok := m.successFiles[id]
+	if !ok {
+		return nil, files.ErrNotFound
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+func (m *retryMockStorage) Delete(ctx context.Context, id string) error {
+	delete(m.successFiles, id)
+	return nil
+}
+
+func TestCleanupOrphanedTempFiles(t *testing.T) {
+	// Create a dedicated temp directory for this test
+	testTempDir, err := os.MkdirTemp("", "satoshisend-test-*")
+	if err != nil {
+		t.Fatalf("failed to create test temp dir: %v", err)
+	}
+	defer os.RemoveAll(testTempDir)
+
+	// Override the global TempDir for this test
+	originalTempDir := TempDir
+	TempDir = testTempDir
+	defer func() { TempDir = originalTempDir }()
+
+	// Create some orphaned temp files
+	orphanedFiles := []string{
+		filepath.Join(testTempDir, TempFilePrefix+"abc123-456"),
+		filepath.Join(testTempDir, TempFilePrefix+"def456-789"),
+		filepath.Join(testTempDir, TempFilePrefix+"ghi789-012"),
+	}
+	for _, f := range orphanedFiles {
+		if err := os.WriteFile(f, []byte("orphaned content"), 0644); err != nil {
+			t.Fatalf("failed to create orphaned file: %v", err)
+		}
+	}
+
+	// Create a non-matching file (should NOT be deleted)
+	nonMatchingFile := filepath.Join(testTempDir, "other-file.txt")
+	if err := os.WriteFile(nonMatchingFile, []byte("other content"), 0644); err != nil {
+		t.Fatalf("failed to create non-matching file: %v", err)
+	}
+
+	// Run cleanup
+	count := CleanupOrphanedTempFiles()
+
+	if count != 3 {
+		t.Errorf("expected 3 files cleaned up, got %d", count)
+	}
+
+	// Verify orphaned files are gone
+	for _, f := range orphanedFiles {
+		if _, err := os.Stat(f); !os.IsNotExist(err) {
+			t.Errorf("orphaned file should be deleted: %s", f)
+		}
+	}
+
+	// Verify non-matching file is still there
+	if _, err := os.Stat(nonMatchingFile); os.IsNotExist(err) {
+		t.Error("non-matching file should NOT be deleted")
+	}
+}
+
+func TestCleanupOrphanedTempFiles_EmptyDir(t *testing.T) {
+	// Create a dedicated temp directory for this test
+	testTempDir, err := os.MkdirTemp("", "satoshisend-test-*")
+	if err != nil {
+		t.Fatalf("failed to create test temp dir: %v", err)
+	}
+	defer os.RemoveAll(testTempDir)
+
+	// Override the global TempDir for this test
+	originalTempDir := TempDir
+	TempDir = testTempDir
+	defer func() { TempDir = originalTempDir }()
+
+	// Run cleanup on empty directory
+	count := CleanupOrphanedTempFiles()
+
+	if count != 0 {
+		t.Errorf("expected 0 files cleaned up, got %d", count)
+	}
+}
+
+func TestHandler_Upload_UsesTempDir(t *testing.T) {
+	// Create a dedicated temp directory for this test
+	testTempDir, err := os.MkdirTemp("", "satoshisend-test-*")
+	if err != nil {
+		t.Fatalf("failed to create test temp dir: %v", err)
+	}
+	defer os.RemoveAll(testTempDir)
+
+	// Override the global TempDir for this test
+	originalTempDir := TempDir
+	TempDir = testTempDir
+	defer func() { TempDir = originalTempDir }()
+
+	// Use a slow storage to give us time to check the temp file
+	storage := &slowMockStorage{delay: 200 * time.Millisecond}
+	st := newMockStore()
+	lnd := payments.NewMockLNDClient()
+
+	filesSvc := files.NewService(storage, st)
+	paymentsSvc := payments.NewService(lnd, st)
+
+	handler := NewHandler(filesSvc, paymentsSvc, nil)
+
+	// Upload a file
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, _ := writer.CreateFormFile("file", "test.txt")
+	part.Write([]byte("test content"))
+	writer.Close()
+
+	req := httptest.NewRequest("POST", "/api/upload", &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload failed: %d", rec.Code)
+	}
+
+	// Check that a temp file exists while upload is in progress
+	time.Sleep(50 * time.Millisecond)
+	files, _ := filepath.Glob(filepath.Join(testTempDir, TempFilePrefix+"*"))
+	if len(files) != 1 {
+		t.Errorf("expected 1 temp file during upload, found %d", len(files))
+	}
+
+	// Verify it has our prefix
+	if len(files) > 0 && !strings.Contains(files[0], TempFilePrefix) {
+		t.Errorf("temp file should have prefix %s, got %s", TempFilePrefix, files[0])
+	}
+}
+
+// slowMockStorage adds a delay to simulate slow uploads
+type slowMockStorage struct {
+	delay time.Duration
+	files map[string][]byte
+}
+
+func (m *slowMockStorage) Save(ctx context.Context, id string, data io.Reader) (int64, error) {
+	return m.SaveWithProgress(ctx, id, data, -1, nil)
+}
+
+func (m *slowMockStorage) SaveWithProgress(ctx context.Context, id string, data io.Reader, size int64, onProgress files.ProgressFunc) (int64, error) {
+	time.Sleep(m.delay)
+	if m.files == nil {
+		m.files = make(map[string][]byte)
+	}
+	buf, _ := io.ReadAll(data)
+	m.files[id] = buf
+	if onProgress != nil {
+		onProgress(int64(len(buf)), int64(len(buf)))
+	}
+	return int64(len(buf)), nil
+}
+
+func (m *slowMockStorage) Load(ctx context.Context, id string) (io.ReadCloser, error) {
+	data, ok := m.files[id]
+	if !ok {
+		return nil, files.ErrNotFound
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+func (m *slowMockStorage) Delete(ctx context.Context, id string) error {
+	delete(m.files, id)
+	return nil
 }

@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -9,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sync"
 	"time"
@@ -17,6 +18,21 @@ import (
 	"satoshisend/internal/logging"
 	"satoshisend/internal/payments"
 	"satoshisend/internal/store"
+)
+
+// TempDir is the directory for temporary upload files.
+// Can be overridden for testing.
+var TempDir = os.TempDir()
+
+const (
+	// TempFilePrefix is the prefix for temporary upload files.
+	TempFilePrefix = "satoshisend-upload-"
+
+	// MaxB2Retries is the maximum number of retry attempts for B2 uploads.
+	MaxB2Retries = 3
+
+	// InitialRetryDelay is the initial delay before first retry.
+	InitialRetryDelay = 1 * time.Second
 )
 
 var validFileIDPattern = regexp.MustCompile(`^[a-zA-Z0-9]+$`)
@@ -28,7 +44,7 @@ type backgroundUpload struct {
 	progress     float64         // 0.0 to 1.0
 	error        string          // error message if status == "error"
 	result       *UploadResponse // final result if status == "complete"
-	data         []byte          // file data to upload
+	tempFilePath string          // path to temporary file containing upload data
 	size         int64           // file size
 	createdAt    time.Time       // when the upload started
 	uploaderIP   string          // IP address of uploader (for rate limiting)
@@ -143,16 +159,7 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	// Read file into memory buffer for background upload
-	var buf bytes.Buffer
-	fileSize, err := io.Copy(&buf, file)
-	if err != nil {
-		http.Error(w, "failed to read file", http.StatusInternalServerError)
-		return
-	}
-	logging.Internal.Printf("upload: received %d bytes", fileSize)
-
-	// Generate upload ID
+	// Generate upload ID first (used for temp file name)
 	uploadIDBytes := make([]byte, 16)
 	if _, err := rand.Read(uploadIDBytes); err != nil {
 		http.Error(w, "failed to generate upload ID", http.StatusInternalServerError)
@@ -160,14 +167,35 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	uploadID := hex.EncodeToString(uploadIDBytes)
 
+	// Create temp file for streaming upload to disk (not memory!)
+	tempFile, err := os.CreateTemp(TempDir, TempFilePrefix+uploadID+"-")
+	if err != nil {
+		logging.Internal.Printf("failed to create temp file: %v", err)
+		http.Error(w, "failed to process upload", http.StatusInternalServerError)
+		return
+	}
+	tempFilePath := tempFile.Name()
+
+	// Stream file to disk
+	fileSize, err := io.Copy(tempFile, file)
+	if err != nil {
+		tempFile.Close()
+		os.Remove(tempFilePath)
+		http.Error(w, "failed to read file", http.StatusInternalServerError)
+		return
+	}
+	tempFile.Close()
+
+	logging.Internal.Printf("upload: received %d bytes -> temp file %s", fileSize, filepath.Base(tempFilePath))
+
 	// Create background upload tracker
 	upload := &backgroundUpload{
-		status:     "uploading",
-		progress:   0,
-		data:       buf.Bytes(),
-		size:       fileSize,
-		createdAt:  time.Now(),
-		uploaderIP: ip,
+		status:       "uploading",
+		progress:     0,
+		tempFilePath: tempFilePath,
+		size:         fileSize,
+		createdAt:    time.Now(),
+		uploaderIP:   ip,
 	}
 	backgroundUploads.Store(uploadID, upload)
 
@@ -188,6 +216,20 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) processBackgroundUpload(uploadID string, upload *backgroundUpload) {
 	ctx := context.Background()
 
+	// Helper to clean up temp file and mark as error
+	markError := func(errMsg string) {
+		upload.mu.Lock()
+		upload.status = "error"
+		upload.error = errMsg
+		tempPath := upload.tempFilePath
+		upload.tempFilePath = ""
+		upload.mu.Unlock()
+
+		if tempPath != "" {
+			os.Remove(tempPath)
+		}
+	}
+
 	// Track progress
 	onProgress := func(written, total int64) {
 		if total > 0 {
@@ -197,17 +239,53 @@ func (h *Handler) processBackgroundUpload(uploadID string, upload *backgroundUpl
 		}
 	}
 
-	// Upload to B2
-	reader := bytes.NewReader(upload.data)
-	result, err := h.files.UploadWithProgress(ctx, reader, upload.size, 7*24*time.Hour, onProgress)
-	if err != nil {
-		logging.Internal.Printf("background upload failed: %v", err)
-		upload.mu.Lock()
-		upload.status = "error"
-		upload.error = "upload failed"
-		upload.data = nil // Free memory
-		upload.mu.Unlock()
+	// Upload to B2 with retry logic
+	var result *files.UploadResult
+	var lastErr error
+	delay := InitialRetryDelay
+
+	for attempt := 1; attempt <= MaxB2Retries; attempt++ {
+		// Open temp file for reading
+		tempFile, err := os.Open(upload.tempFilePath)
+		if err != nil {
+			logging.Internal.Printf("failed to open temp file: %v", err)
+			markError("failed to read upload data")
+			return
+		}
+
+		result, lastErr = h.files.UploadWithProgress(ctx, tempFile, upload.size, 7*24*time.Hour, onProgress)
+		tempFile.Close()
+
+		if lastErr == nil {
+			break // Success!
+		}
+
+		logging.Internal.Printf("B2 upload attempt %d/%d failed: %v", attempt, MaxB2Retries, lastErr)
+
+		if attempt < MaxB2Retries {
+			// Reset progress for retry
+			upload.mu.Lock()
+			upload.progress = 0
+			upload.mu.Unlock()
+
+			time.Sleep(delay)
+			delay *= 2 // Exponential backoff
+		}
+	}
+
+	if lastErr != nil {
+		logging.Internal.Printf("background upload failed after %d attempts: %v", MaxB2Retries, lastErr)
+		markError("upload failed")
 		return
+	}
+
+	// Clean up temp file after successful upload
+	upload.mu.Lock()
+	tempPath := upload.tempFilePath
+	upload.tempFilePath = ""
+	upload.mu.Unlock()
+	if tempPath != "" {
+		os.Remove(tempPath)
 	}
 
 	// Calculate price: 1 sat per MB, minimum 100 sats
@@ -223,7 +301,6 @@ func (h *Handler) processBackgroundUpload(uploadID string, upload *backgroundUpl
 		upload.mu.Lock()
 		upload.status = "error"
 		upload.error = "failed to create invoice"
-		upload.data = nil
 		upload.mu.Unlock()
 		return
 	}
@@ -244,7 +321,6 @@ func (h *Handler) processBackgroundUpload(uploadID string, upload *backgroundUpl
 		PaymentHash:    invoice.PaymentHash,
 		AmountSats:     invoice.AmountSats,
 	}
-	upload.data = nil // Free memory
 	upload.mu.Unlock()
 
 	logging.Internal.Printf("background upload complete: %s -> %s", uploadID, result.ID)
@@ -426,4 +502,27 @@ func (h *Handler) handleAlbyWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// CleanupOrphanedTempFiles removes any leftover temp files from previous runs.
+// This should be called at startup to clean up files from crashed/restarted processes.
+// Returns the number of files cleaned up.
+func CleanupOrphanedTempFiles() int {
+	pattern := filepath.Join(TempDir, TempFilePrefix+"*")
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		logging.Internal.Printf("failed to glob temp files: %v", err)
+		return 0
+	}
+
+	count := 0
+	for _, path := range matches {
+		if err := os.Remove(path); err != nil {
+			logging.Internal.Printf("failed to remove orphaned temp file %s: %v", filepath.Base(path), err)
+		} else {
+			count++
+		}
+	}
+
+	return count
 }
