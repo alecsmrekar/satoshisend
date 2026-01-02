@@ -116,7 +116,6 @@ func (s *B2Storage) Save(ctx context.Context, id string, data io.Reader) (int64,
 
 func (s *B2Storage) SaveWithProgress(ctx context.Context, id string, data io.Reader, size int64, onProgress ProgressFunc) (int64, error) {
 	key := s.key(id)
-	logging.B2.Printf("uploading file %s to bucket %s", key, s.bucket)
 
 	// Wrap reader with progress tracking if callback provided
 	var reader io.Reader = data
@@ -134,7 +133,6 @@ func (s *B2Storage) SaveWithProgress(ctx context.Context, id string, data io.Rea
 		return 0, err
 	}
 
-	logging.B2.Printf("uploaded %s successfully (%d bytes)", key, info.Size)
 	return info.Size, nil
 }
 
@@ -159,7 +157,6 @@ func (pr *progressReader) Read(p []byte) (int, error) {
 
 func (s *B2Storage) Load(ctx context.Context, id string) (io.ReadCloser, error) {
 	key := s.key(id)
-	logging.B2.Printf("loading file %s from bucket %s", key, s.bucket)
 
 	obj, err := s.client.GetObject(ctx, s.bucket, key, minio.GetObjectOptions{})
 	if err != nil {
@@ -168,38 +165,33 @@ func (s *B2Storage) Load(ctx context.Context, id string) (io.ReadCloser, error) 
 	}
 
 	// Check if object exists by attempting to stat it
-	stat, err := obj.Stat()
+	_, err = obj.Stat()
 	if err != nil {
 		obj.Close()
 		errResp := minio.ToErrorResponse(err)
 		if errResp.Code == "NoSuchKey" {
-			logging.B2.Printf("file %s not found", key)
 			return nil, ErrNotFound
 		}
 		logging.B2.Printf("failed to stat object %s: %v", key, err)
 		return nil, err
 	}
 
-	logging.B2.Printf("loaded %s successfully (%d bytes)", key, stat.Size)
 	return obj, nil
 }
 
 func (s *B2Storage) Delete(ctx context.Context, id string) error {
 	key := s.key(id)
-	logging.B2.Printf("deleting file %s from bucket %s", key, s.bucket)
 
 	err := s.client.RemoveObject(ctx, s.bucket, key, minio.RemoveObjectOptions{})
 	if err != nil {
 		errResp := minio.ToErrorResponse(err)
 		if errResp.Code == "NoSuchKey" {
-			logging.B2.Printf("file %s not found for deletion", key)
 			return ErrNotFound
 		}
 		logging.B2.Printf("failed to delete %s: %v", key, err)
 		return err
 	}
 
-	logging.B2.Printf("deleted %s successfully", key)
 	return nil
 }
 
@@ -220,19 +212,16 @@ func (s *B2Storage) GetPublicURL(id string) string {
 // Stat returns the size of a file in B2.
 func (s *B2Storage) Stat(ctx context.Context, id string) (int64, error) {
 	key := s.key(id)
-	logging.B2.Printf("stat file %s in bucket %s", key, s.bucket)
 
 	info, err := s.client.StatObject(ctx, s.bucket, key, minio.StatObjectOptions{})
 	if err != nil {
 		errResp := minio.ToErrorResponse(err)
 		if errResp.Code == "NoSuchKey" {
-			logging.B2.Printf("file %s not found", key)
 			return 0, ErrNotFound
 		}
 		logging.B2.Printf("failed to stat %s: %v", key, err)
 		return 0, err
 	}
 
-	logging.B2.Printf("stat %s: %d bytes", key, info.Size)
 	return info.Size, nil
 }

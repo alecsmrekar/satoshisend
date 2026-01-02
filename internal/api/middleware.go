@@ -17,8 +17,13 @@ func Logger(next http.Handler) http.Handler {
 		wrapped := &responseWriter{ResponseWriter: w, status: 200}
 		next.ServeHTTP(wrapped, r)
 
+		// Only log API requests
+		if !strings.HasPrefix(r.URL.Path, "/api/") {
+			return
+		}
+
 		// Skip logging for status polling endpoints to reduce noise
-		if strings.HasSuffix(r.URL.Path, "/status") && strings.HasPrefix(r.URL.Path, "/api/file/") {
+		if strings.HasSuffix(r.URL.Path, "/status") {
 			return
 		}
 

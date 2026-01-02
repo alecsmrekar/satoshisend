@@ -71,11 +71,10 @@ func NewAlbyHTTPClient(cfg AlbyConfig) (*AlbyHTTPClient, error) {
 	}
 
 	// Test the connection
-	logging.Alby.Println("testing connection...")
 	if err := c.testConnection(); err != nil {
 		return nil, fmt.Errorf("failed to connect to Alby: %w", err)
 	}
-	logging.Alby.Println("connected successfully!")
+	logging.Alby.Println("connected")
 
 	return c, nil
 }
@@ -102,8 +101,6 @@ func (c *AlbyHTTPClient) testConnection() error {
 }
 
 func (c *AlbyHTTPClient) CreateInvoice(ctx context.Context, amountSats int64, memo string) (*Invoice, error) {
-	logging.Alby.Printf("creating invoice for %d sats...", amountSats)
-
 	reqBody := albyCreateInvoiceRequest{
 		Amount:      amountSats,
 		Description: memo,
@@ -180,18 +177,15 @@ func (c *AlbyHTTPClient) HandleWebhook(body []byte, headers http.Header) error {
 	}
 
 	if payload.Settled && payload.PaymentHash != "" {
-		logging.Alby.Printf("webhook: invoice %s settled!", payload.PaymentHash[:16])
+		logging.Alby.Printf("invoice %s settled", payload.PaymentHash[:16])
 
 		select {
 		case c.updates <- InvoiceUpdate{
 			PaymentHash: payload.PaymentHash,
 			Settled:     true,
 		}:
-			logging.Alby.Printf("webhook: queued payment %s (buffer: %d/%d)", payload.PaymentHash[:16], len(c.updates), cap(c.updates))
 		default:
-			// Payment dropped from channel - will be recovered from DB on next webhook or restart
-			logging.Alby.Printf("webhook: WARNING - update channel full (%d/%d), payment %s not queued (persisted to DB). Payment hash: %s",
-				len(c.updates), cap(c.updates), payload.PaymentHash[:16], payload.PaymentHash)
+			logging.Alby.Printf("WARNING: update channel full, payment %s may be delayed", payload.PaymentHash[:16])
 		}
 	}
 
@@ -204,8 +198,6 @@ func (c *AlbyHTTPClient) verifyWebhookSignature(body []byte, headers http.Header
 	svixID := headers.Get("svix-id")
 	svixTimestamp := headers.Get("svix-timestamp")
 	svixSignature := headers.Get("svix-signature")
-
-	logging.Alby.Printf("webhook: svix-id=%s timestamp=%s sig=%s...", svixID, svixTimestamp, truncate(svixSignature, 20))
 
 	if svixID == "" || svixTimestamp == "" || svixSignature == "" {
 		return fmt.Errorf("missing SVIX headers")
@@ -262,9 +254,3 @@ func parseTimestamp(ts string) (time.Time, error) {
 	return time.Unix(unix, 0), nil
 }
 
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
-}
