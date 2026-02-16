@@ -77,6 +77,20 @@ func (s *FSStorage) Load(ctx context.Context, id string) (io.ReadCloser, error) 
 	return f, err
 }
 
+func (s *FSStorage) Stat(ctx context.Context, id string) (int64, error) {
+	if err := s.validateID(id); err != nil {
+		return 0, err
+	}
+	info, err := os.Stat(s.path(id))
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
 func (s *FSStorage) Delete(ctx context.Context, id string) error {
 	if err := s.validateID(id); err != nil {
 		return err

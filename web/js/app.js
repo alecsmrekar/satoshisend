@@ -61,6 +61,7 @@ const copyInvoiceBtn = document.getElementById('copy-invoice');
 const amountSats = document.getElementById('amount-sats');
 const paymentStatus = document.getElementById('payment-status');
 const qrContainer = document.getElementById('qr-container');
+const weblnPayBtn = document.getElementById('webln-pay');
 
 const shareUrl = document.getElementById('share-url');
 const copyLinkBtn = document.getElementById('copy-link');
@@ -244,10 +245,27 @@ async function initPending(fileId, key) {
         // Generate QR code
         await generateQRCode(invoice.payment_request);
 
+        // WebLN: offer one-click payment if wallet is available
+        if (window.webln) {
+            weblnPayBtn.classList.remove('hidden');
+            weblnPayBtn.addEventListener('click', async () => {
+                weblnPayBtn.disabled = true;
+                weblnPayBtn.textContent = 'Opening wallet...';
+                try {
+                    await window.webln.enable();
+                    await window.webln.sendPayment(invoice.payment_request);
+                } catch (err) {
+                    // User rejected or wallet error - they can still use QR/copy
+                    weblnPayBtn.disabled = false;
+                    weblnPayBtn.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg> Pay with Wallet';
+                }
+            }, { once: true });
+        }
+
         // Setup copy button
         copyInvoiceBtn.addEventListener('click', () => copyToClipboard(copyInvoiceBtn, invoiceCode.textContent));
 
-        // Poll for payment
+        // Poll for payment (works regardless of WebLN or QR/manual pay)
         pollPaymentStatus(fileId, () => {
             updatePaymentStatus('Payment received!', true);
             setTimeout(() => showSharePage(fileId, key), 1000);

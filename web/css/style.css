@@ -548,6 +548,23 @@ button.secondary:hover:not(:disabled) {
     color: var(--error-red);
 }
 
+/* WebLN Pay Button */
+.webln-pay {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    width: 100%;
+    padding: 14px 24px;
+    background: linear-gradient(135deg, var(--accent-orange) 0%, #e8850f 100%);
+    box-shadow: 0 2px 12px var(--accent-orange-glow);
+    font-size: 1.05rem;
+}
+
+.webln-pay:hover:not(:disabled) {
+    box-shadow: 0 4px 20px var(--accent-orange-glow);
+}
+
 /* Invoice Display */
 .invoice-container {
     background: var(--bg-primary);
