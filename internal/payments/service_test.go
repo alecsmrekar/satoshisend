@@ -2,6 +2,8 @@ package payments
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -257,5 +259,93 @@ func TestService_PaymentWatcher(t *testing.T) {
 	_, err := svc.GetInvoiceForFile(fileID)
 	if err != ErrInvoiceNotFound {
 		t.Error("expected pending invoice to be cleared")
+	}
+}
+
+// scanLND returns fixed scan results, to simulate a lost notification or a failed scan.
+type scanLND struct {
+	*MockLNDClient
+	settled []string
+	err     error
+}
+
+func (f *scanLND) ListSettled(ctx context.Context, since time.Time) ([]string, error) {
+	return f.settled, f.err
+}
+
+func TestService_ScanFindsMissedPayment(t *testing.T) {
+	lnd := &scanLND{MockLNDClient: NewMockLNDClient()}
+	st := newMockStore()
+	svc := NewService(lnd, st)
+	ctx := context.Background()
+
+	fileID := "test-scan-file"
+	st.SaveFileMetadata(ctx, &store.FileMeta{
+		ID:        fileID,
+		Size:      1024,
+		ExpiresAt: time.Now().Add(time.Hour),
+		CreatedAt: time.Now(),
+	})
+
+	inv, err := svc.CreateInvoiceForFile(ctx, fileID, 500)
+	if err != nil {
+		t.Fatalf("create invoice failed: %v", err)
+	}
+
+	lnd.settled = []string{strings.Repeat("0", 64), inv.PaymentHash}
+	svc.scan(ctx)
+
+	meta, _ := st.GetFileMetadata(ctx, fileID)
+	if !meta.Paid {
+		t.Error("expected file to be marked as paid")
+	}
+	if len(st.invoices) != 0 {
+		t.Errorf("expected 0 invoices in store after scan, got %d", len(st.invoices))
+	}
+}
+
+func TestService_ScanRemovesExpiredInvoices(t *testing.T) {
+	lnd := &scanLND{MockLNDClient: NewMockLNDClient()}
+	st := newMockStore()
+	expiredHash := strings.Repeat("e", 64)
+	recentHash := strings.Repeat("f", 64)
+
+	// Invoices expire after 10 minutes. The scan waits 15 more minutes before it removes one.
+	st.invoices[expiredHash] = &store.PendingInvoice{
+		PaymentHash: expiredHash,
+		FileID:      "expired-file",
+		CreatedAt:   time.Now().Add(-26 * time.Minute),
+	}
+	st.invoices[recentHash] = &store.PendingInvoice{
+		PaymentHash: recentHash,
+		FileID:      "recent-file",
+		CreatedAt:   time.Now().Add(-24 * time.Minute),
+	}
+
+	svc := NewService(lnd, st)
+	ctx := context.Background()
+	if err := svc.LoadPendingInvoices(ctx); err != nil {
+		t.Fatalf("LoadPendingInvoices failed: %v", err)
+	}
+
+	lnd.err = errors.New("relay unavailable")
+	svc.scan(ctx)
+	if len(st.invoices) != 2 {
+		t.Fatalf("a failed scan removed invoices: %d left, want 2", len(st.invoices))
+	}
+
+	lnd.err = nil
+	svc.scan(ctx)
+	if _, ok := st.invoices[expiredHash]; ok {
+		t.Error("expected expired invoice to be removed from store")
+	}
+	if _, err := svc.GetInvoiceForFile("expired-file"); err != ErrInvoiceNotFound {
+		t.Error("expected expired invoice to be removed from memory")
+	}
+	if _, ok := st.invoices[recentHash]; !ok {
+		t.Error("expected recent invoice to stay in store")
+	}
+	if _, err := svc.GetInvoiceForFile("recent-file"); err != nil {
+		t.Error("expected recent invoice to stay in memory")
 	}
 }

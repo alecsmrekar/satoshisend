@@ -29,7 +29,8 @@ SatoshiSend is a file sharing application with Bitcoin-only payments. Files are 
 
 ### Payment Flow
 - Bitcoin via Lightning Network for instant confirmations
-- Backend integrates with LND via `LNDClient` interface
+- Backend integrates with the wallet via `LNDClient` interface. `NWCClient` implements it with Nostr Wallet Connect (NIP-47), configured by `NWC_URI`
+- Payments arrive as `payment_received` notifications. A wallet scan every 30 seconds finds payments whose notification was lost
 - Mock implementation (`MockLNDClient`) auto-settles invoices after 20 seconds for development
 
 ## Code Structure

@@ -46,8 +46,9 @@ cd satoshisend
 # Development mode (mock payments auto-settle after 20 seconds)
 ./run.sh
 
-# Production mode (real Lightning payments)
-export ALBY_TOKEN="your-access-token"
+# Production mode (real Lightning payments, see "Lightning Payments with NWC")
+export NWC_URI="nostr+walletconnect://..."
+export NWC_ALLOW_SPEND_CAPABLE=true
 go run ./cmd/server
 ```
 
@@ -70,81 +71,51 @@ Open [http://localhost:8080](http://localhost:8080) in your browser.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `ALBY_TOKEN` | No | Alby Wallet API token for Lightning payments. Uses mock client if not set. |
-| `ALBY_WEBHOOK_SECRET` | If using Alby | SVIX webhook secret from your Alby webhook endpoint (see setup below) |
+| `NWC_URI` | No | Nostr Wallet Connect string for Lightning payments. Uses mock client if not set. |
+| `NWC_ALLOW_SPEND_CAPABLE` | If the connection can spend | Set to `true` to start with a connection that can spend funds (required for coinos) |
 | `B2_KEY_ID` | No | Backblaze B2 key ID (enables cloud storage) |
 | `B2_APP_KEY` | No | Backblaze B2 application key |
 | `B2_BUCKET` | No | Backblaze B2 bucket name |
 | `B2_PREFIX` | No | Optional folder prefix for B2 objects |
 | `B2_PUBLIC_URL` | No | Public URL for direct B2 downloads |
 
-## Lightning Payments with Alby
+## Lightning Payments with NWC
 
-SatoshiSend uses [Alby](https://getalby.com) for Lightning Network payments.
+SatoshiSend receives payments through Nostr Wallet Connect (NWC, [NIP-47](https://github.com/nostr-protocol/nips/blob/master/47.md)). The server creates invoices in your wallet and gets a notification when a payer pays. It also scans the wallet every 30 seconds to find payments whose notification was lost.
 
-### 1. Get an API Token
+The server refuses to start with a connection that can spend funds, unless you set `NWC_ALLOW_SPEND_CAPABLE=true`. Use a receive-only connection if your wallet can make one.
 
-1. Log in at [getalby.com](https://getalby.com)
-2. Go to [Developer Portal → Access Tokens](https://getalby.com/developer/access_tokens/new)
-3. Create a token with these scopes:
-   - `invoices:create` — Create payment invoices
-   - `invoices:read` — Check payment status
-4. Set an expiry date and click **Create**
-5. Save the token as `ALBY_TOKEN`
+### 1. Create a coinos Connection
 
-### 2. Register a Webhook (one-time setup)
+Every coinos connection can spend funds. Give the connection a spend budget of 1 sat. Then a leaked connection string can spend at most 1 sat.
 
-Register a webhook endpoint with Alby to receive payment notifications.
+1. Log in to [coinos](https://coinos.io).
+2. Open the Nostr settings at `https://coinos.io/settings/nostr`.
+3. Create a new NWC connection with the name `satoshisend`.
+4. Set the spending budget to `1` sat.
+5. Set the budget renewal to "Never".
+6. Set notifications to on.
+7. Copy the `nostr+walletconnect://` string.
 
-**Option A: Via the Alby Dashboard**
+On coinos, a budget of `0` or an empty budget means "no limit". Do not use `0`.
 
-1. Go to [Developer Portal → Webhook Endpoints](https://getalby.com/developer/webhook_endpoints)
-2. Click **Add Webhook Endpoint**
-3. Set URL to `https://your-domain.com/api/webhook/alby`
-4. Select event type `invoice.incoming.settled`
-5. Copy the **Endpoint Secret** and save it as `ALBY_WEBHOOK_SECRET`
+If notifications are off, the server still finds payments through the wallet scan. The payer then waits up to 30 seconds for the confirmation.
 
-**Option B: Via the API**
+### 2. Run with Real Payments
 
 ```bash
-curl -X POST https://api.getalby.com/webhook_endpoints \
-  -H "Authorization: Bearer $ALBY_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "url": "https://your-domain.com/api/webhook/alby",
-    "filter_types": ["invoice.incoming.settled"],
-    "description": "SatoshiSend payments"
-  }'
-```
-
-The response contains `endpoint_secret` — save this as `ALBY_WEBHOOK_SECRET`.
-
-### 3. Run with Real Payments
-
-```bash
-export ALBY_TOKEN="your-access-token"
-export ALBY_WEBHOOK_SECRET="whsec_..."
+export NWC_URI="nostr+walletconnect://..."
+export NWC_ALLOW_SPEND_CAPABLE=true   # only for a connection that can spend
 go run ./cmd/server
 ```
 
-### Managing Webhooks
-
-```bash
-# List all webhook endpoints
-curl -H "Authorization: Bearer $ALBY_TOKEN" \
-  https://api.getalby.com/webhook_endpoints
-
-# Delete a webhook endpoint
-curl -X DELETE -H "Authorization: Bearer $ALBY_TOKEN" \
-  https://api.getalby.com/webhook_endpoints/<endpoint-id>
-```
+At startup, the server asks the wallet what the connection can do. It stops with an error if the wallet cannot create and list invoices.
 
 ### Security Notes
 
-- Never commit tokens or secrets to version control
-- Use minimal required scopes
-- Set appropriate token expiry dates
-- Treat tokens and webhook secrets like passwords
+- The NWC string is a secret. Never commit it to version control.
+- If the string leaks, delete the connection in your wallet and create a new one.
+- Keep the spend budget small on a connection that can spend.
 
 ## Cloud Storage with Backblaze B2
 
@@ -187,7 +158,7 @@ cmd/server/          # Application entrypoint
 internal/
 ├── api/             # HTTP handlers and middleware
 ├── files/           # File storage (filesystem + B2)
-├── payments/        # Lightning payments (Alby + mock)
+├── payments/        # Lightning payments (NWC + mock)
 ├── store/           # SQLite metadata storage
 └── logging/         # Structured logging
 web/
@@ -209,14 +180,16 @@ Type=simple
 User=satoshisend
 WorkingDirectory=/opt/satoshisend
 ExecStart=/opt/satoshisend/server
-Environment=ALBY_TOKEN=your-token
-Environment=ALBY_WEBHOOK_SECRET=whsec_your-secret
+Environment=NWC_URI=nostr+walletconnect://your-connection
+Environment=NWC_ALLOW_SPEND_CAPABLE=true
 Environment=B2_BUCKET=your-bucket
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+systemd reads `%` in `Environment=` as a specifier. Write each `%` in the NWC string as `%%`, for example `relay=wss%%3A%%2F%%2Frelay.coinos.io`.
 
 ### Viewing Logs
 
@@ -228,13 +201,13 @@ journalctl -u satoshisend
 journalctl -u satoshisend -f
 
 # Filter by component
-journalctl -u satoshisend | grep '\[alby\]'
+journalctl -u satoshisend | grep '\[nwc\]'
 
 # Last hour only
 journalctl -u satoshisend --since "1 hour ago"
 ```
 
-Log prefixes: `[internal]` `[http]` `[b2]` `[alby]`
+Log prefixes: `[internal]` `[http]` `[b2]` `[nwc]`
 
 ## Pricing Model
 

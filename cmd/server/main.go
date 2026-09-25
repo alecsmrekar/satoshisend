@@ -126,27 +126,21 @@ func main() {
 	// Initialize services
 	filesSvc := files.NewService(storage, st)
 
-	// Initialize LND client - use Alby HTTP API if configured, otherwise mock
+	// Initialize LND client - use NWC if configured, otherwise mock
 	var lndClient payments.LNDClient
-	var albyClient *payments.AlbyHTTPClient
-	albyToken := os.Getenv("ALBY_TOKEN")
-	albyWebhookSecret := os.Getenv("ALBY_WEBHOOK_SECRET")
-	if albyToken != "" && albyWebhookSecret != "" {
-		var err error
-		albyClient, err = payments.NewAlbyHTTPClient(payments.AlbyConfig{
-			AccessToken:   albyToken,
-			WebhookSecret: albyWebhookSecret,
+	if nwcURI := os.Getenv("NWC_URI"); nwcURI != "" {
+		nwcClient, err := payments.NewNWCClient(payments.NWCConfig{
+			URI:               nwcURI,
+			AllowSpendCapable: os.Getenv("NWC_ALLOW_SPEND_CAPABLE") == "true",
 		})
 		if err != nil {
-			logging.Internal.Fatalf("failed to connect to Alby wallet: %v", err)
+			logging.Internal.Fatalf("failed to connect to NWC wallet: %v", err)
 		}
-		lndClient = albyClient
-		logging.Internal.Println("connected to Lightning wallet via Alby HTTP API")
-	} else if albyToken != "" {
-		logging.Internal.Fatalf("ALBY_TOKEN is set but ALBY_WEBHOOK_SECRET is missing (see README for webhook setup)")
+		lndClient = nwcClient
+		logging.Internal.Println("connected to Lightning wallet via NWC")
 	} else {
 		lndClient = payments.NewMockLNDClient()
-		logging.Internal.Println("using mock LND client (set ALBY_TOKEN and ALBY_WEBHOOK_SECRET for real payments)")
+		logging.Internal.Println("using mock LND client (set NWC_URI for real payments)")
 	}
 	paymentsSvc := payments.NewService(lndClient, st)
 
@@ -196,11 +190,6 @@ func main() {
 
 	// Setup HTTP handler
 	handler := api.NewHandler(filesSvc, paymentsSvc, pendingLimiter)
-
-	// Wire up Alby webhook handler if configured
-	if albyClient != nil {
-		handler.SetWebhookHandler(albyClient)
-	}
 
 	// Serve static files for the frontend
 	fs := http.FileServer(http.Dir("web"))

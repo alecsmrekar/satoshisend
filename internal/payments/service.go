@@ -22,6 +22,7 @@ type PendingInvoice struct {
 	FileID      string
 	PaymentHash string
 	Invoice     *Invoice
+	CreatedAt   time.Time
 }
 
 // Service handles payment operations.
@@ -58,6 +59,7 @@ func (s *Service) CreateInvoiceForFile(ctx context.Context, fileID string, amoun
 		FileID:      fileID,
 		PaymentHash: inv.PaymentHash,
 		Invoice:     inv,
+		CreatedAt:   time.Now(),
 	}
 
 	// Persist to database for restart recovery
@@ -66,7 +68,7 @@ func (s *Service) CreateInvoiceForFile(ctx context.Context, fileID string, amoun
 		FileID:         fileID,
 		PaymentRequest: inv.PaymentRequest,
 		AmountSats:     amountSats,
-		CreatedAt:      time.Now(),
+		CreatedAt:      pending.CreatedAt,
 	}
 	if err := s.store.SavePendingInvoice(ctx, storeInv); err != nil {
 		logging.Internal.Printf("failed to persist invoice %s: %v", inv.PaymentHash[:16], err)
@@ -104,6 +106,7 @@ func (s *Service) SetPaymentCallback(cb PaymentCallback) {
 
 // StartPaymentWatcher starts watching for invoice payments.
 // It marks files as paid when their invoices are settled.
+// It also scans the wallet at start and every 30 seconds, to find payments whose notification was lost.
 func (s *Service) StartPaymentWatcher(ctx context.Context) error {
 	updates, err := s.lnd.SubscribeInvoices(ctx)
 	if err != nil {
@@ -126,10 +129,73 @@ func (s *Service) StartPaymentWatcher(ctx context.Context) error {
 		}
 	}()
 
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			s.scan(ctx)
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+
 	return nil
 }
 
-func (s *Service) handlePayment(ctx context.Context, paymentHash string) {
+// scan asks the wallet for settled payments since the oldest pending invoice.
+// After a successful scan, it removes each unpaid invoice that expired more than 15 minutes before the scan started.
+// The 15 minutes cover a payment that was in flight when its invoice expired.
+func (s *Service) scan(ctx context.Context) {
+	s.mu.RLock()
+	var oldest time.Time
+	for _, p := range s.pending {
+		if oldest.IsZero() || p.CreatedAt.Before(oldest) {
+			oldest = p.CreatedAt
+		}
+	}
+	s.mu.RUnlock()
+	if oldest.IsZero() {
+		return
+	}
+
+	scanStart := time.Now()
+	// The 5 minutes allow for clock skew between this server and the wallet.
+	hashes, err := s.lnd.ListSettled(ctx, oldest.Add(-5*time.Minute))
+	if err != nil {
+		logging.Internal.Printf("wallet scan failed: %v", err)
+		return
+	}
+	for _, hash := range hashes {
+		if s.handlePayment(ctx, hash) {
+			logging.Internal.Printf("wallet scan found payment %s", hash[:16])
+		}
+	}
+
+	cutoff := scanStart.Add(-(InvoiceExpiry + 15*time.Minute))
+	var expired []*PendingInvoice
+	s.mu.Lock()
+	for hash, p := range s.pending {
+		if p.CreatedAt.Before(cutoff) {
+			expired = append(expired, p)
+			delete(s.pending, hash)
+			delete(s.byFileID, p.FileID)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, p := range expired {
+		if err := s.store.DeletePendingInvoice(ctx, p.PaymentHash); err != nil {
+			logging.Internal.Printf("failed to delete expired invoice %s: %v", p.PaymentHash[:16], err)
+		}
+	}
+}
+
+// handlePayment marks the file of a pending invoice as paid.
+// It returns false if no pending invoice has this payment hash.
+func (s *Service) handlePayment(ctx context.Context, paymentHash string) bool {
 	s.mu.Lock()
 	pending, ok := s.pending[paymentHash]
 	cb := s.onPayment
@@ -161,6 +227,7 @@ func (s *Service) handlePayment(ctx context.Context, paymentHash string) {
 			}()
 		}
 	}
+	return ok
 }
 
 // LoadPendingInvoices loads pending invoices from the database into memory.
@@ -183,6 +250,7 @@ func (s *Service) LoadPendingInvoices(ctx context.Context) error {
 				PaymentRequest: inv.PaymentRequest,
 				AmountSats:     inv.AmountSats,
 			},
+			CreatedAt: inv.CreatedAt,
 		}
 		s.pending[inv.PaymentHash] = pending
 		s.byFileID[inv.FileID] = pending

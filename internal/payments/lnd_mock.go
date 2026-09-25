@@ -54,6 +54,11 @@ func (m *MockLNDClient) SubscribeInvoices(ctx context.Context) (<-chan InvoiceUp
 	return m.updates, nil
 }
 
+// ListSettled reports nothing. The mock reports settlements only through SubscribeInvoices.
+func (m *MockLNDClient) ListSettled(ctx context.Context, since time.Time) ([]string, error) {
+	return nil, nil
+}
+
 // SimulatePayment simulates a payment being received (for testing).
 func (m *MockLNDClient) SimulatePayment(paymentHash string) {
 	m.updates <- InvoiceUpdate{

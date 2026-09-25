@@ -3,7 +3,6 @@ package api
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"regexp"
 	"time"
@@ -16,16 +15,10 @@ import (
 
 var validFileIDPattern = regexp.MustCompile(`^[a-zA-Z0-9]+$`)
 
-// WebhookHandler is an interface for handling webhook callbacks.
-type WebhookHandler interface {
-	HandleWebhook(body []byte, headers http.Header) error
-}
-
 // Handler handles HTTP requests.
 type Handler struct {
 	files          *files.Service
 	payments       *payments.Service
-	webhookHandler WebhookHandler
 	pendingLimiter *PendingFileLimiter
 	mux            *http.ServeMux
 }
@@ -43,11 +36,6 @@ func NewHandler(files *files.Service, payments *payments.Service, pendingLimiter
 	return h
 }
 
-// SetWebhookHandler sets the webhook handler for payment notifications.
-func (h *Handler) SetWebhookHandler(wh WebhookHandler) {
-	h.webhookHandler = wh
-}
-
 func (h *Handler) registerRoutes() {
 	h.mux.HandleFunc("POST /api/upload/init", h.handleUploadInit)
 	h.mux.HandleFunc("POST /api/upload/complete", h.handleUploadComplete)
@@ -56,7 +44,6 @@ func (h *Handler) registerRoutes() {
 	h.mux.HandleFunc("HEAD /api/file/{id}", h.handleDownload)
 	h.mux.HandleFunc("GET /api/file/{id}/status", h.handleStatus)
 	h.mux.HandleFunc("GET /api/file/{id}/invoice", h.handleGetInvoice)
-	h.mux.HandleFunc("POST /api/webhook/alby", h.handleAlbyWebhook)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -359,27 +346,4 @@ func (h *Handler) handleGetInvoice(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		logging.Internal.Printf("failed to encode response: %v", err)
 	}
-}
-
-func (h *Handler) handleAlbyWebhook(w http.ResponseWriter, r *http.Request) {
-	if h.webhookHandler == nil {
-		http.Error(w, "webhook handler not configured", http.StatusServiceUnavailable)
-		return
-	}
-
-	// Read raw body for signature verification
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		logging.Internal.Printf("webhook: failed to read body: %v", err)
-		http.Error(w, "failed to read body", http.StatusBadRequest)
-		return
-	}
-
-	if err := h.webhookHandler.HandleWebhook(body, r.Header); err != nil {
-		logging.Internal.Printf("webhook: failed to process: %v", err)
-		http.Error(w, "webhook processing failed", http.StatusBadRequest)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
 }
